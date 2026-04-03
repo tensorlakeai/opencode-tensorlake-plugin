@@ -88,6 +88,7 @@ export TENSORLAKE_API_KEY=your_api_key_here
 |---|---|---|
 | `TENSORLAKE_API_KEY` | (required) | Your TensorLake API key |
 | `TENSORLAKE_API_URL` | `https://api.tensorlake.ai` | Override the management API base URL |
+| `TENSORLAKE_IMAGE` | `ubuntu:24.04` | Container image to use when creating a new sandbox |
 | `TENSORLAKE_SANDBOX_PROXY_URL` | (auto) | Override the sandbox proxy URL (useful for local development). When set, all sandboxes use this single URL instead of the `https://{id}.sandbox.tensorlake.ai` pattern |
 
 ---

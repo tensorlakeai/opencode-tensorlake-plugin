@@ -139,7 +139,8 @@ export class TensorLakeSessionManager {
     // Create new sandbox
     logger.info(`Creating new sandbox for session ${sessionId}`)
     const createStart = Date.now()
-    const created = await this.client.createSandbox({})
+    const image = process.env.TENSORLAKE_IMAGE
+    const created = await this.client.createSandbox(image ? { image } : {})
     logger.info(`Sandbox created ${created.sandbox_id} in ${Date.now() - createStart}ms`)
 
     await this.client.waitForRunning(created.sandbox_id)
