@@ -6,7 +6,7 @@ export async function systemPromptTransform(ctx: PluginInput, workDir: string) {
     output.system.push(
       [
         '## TensorLake Sandbox Integration',
-        'This session is running inside a TensorLake sandbox (isolated Firecracker MicroVM).',
+        'This session is running inside a TensorLake sandbox.',
         `The working directory is: ${workDir}`,
         'All bash commands, file reads/writes, and searches run inside the sandbox.',
         `Put all project files in ${workDir}. Do NOT use paths from the host system.`,
