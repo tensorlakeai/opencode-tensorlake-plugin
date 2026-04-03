@@ -23,6 +23,7 @@ export type ExperimentalChatSystemTransformOutput = {
 
 export const EVENT_TYPE_SESSION_DELETED = 'session.deleted'
 export const EVENT_TYPE_SESSION_IDLE = 'session.idle'
+export const EVENT_TYPE_SERVER_INSTANCE_DISPOSED = 'server.instance.disposed'
 
 export type LogLevel = 'INFO' | 'ERROR' | 'WARN'
 

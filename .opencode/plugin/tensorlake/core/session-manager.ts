@@ -3,7 +3,7 @@ import { join } from 'path'
 import { TensorLakeClient, getSandboxProxyUrl } from './client.js'
 import { logger } from './logger.js'
 import { toast } from './toast.js'
-import type { ProjectSessionData, SessionInfo } from './types.js'
+import type { ProjectSessionData } from './types.js'
 import type { PluginInput } from '@opencode-ai/plugin'
 
 export class TensorLakeSessionManager {
@@ -109,30 +109,42 @@ export class TensorLakeSessionManager {
       }
     }
 
-    // Check persistent storage
+    // Check persistent storage — first for this session, then for any session in the project
     const projectData = this.loadProjectData(projectId)
-    const stored = projectData?.sessions[sessionId]
-    if (stored) {
-      logger.info(`Reconnecting to sandbox ${stored.sandboxId} for session ${sessionId}`)
+    const candidateSessions = projectData
+      ? [
+          // Session-specific entry first, then all others (most recently accessed first)
+          ...(projectData.sessions[sessionId] ? [[sessionId, projectData.sessions[sessionId]] as const] : []),
+          ...Object.entries(projectData.sessions)
+            .filter(([id]) => id !== sessionId)
+            .sort(([, a], [, b]) => b.lastAccessed - a.lastAccessed),
+        ]
+      : []
+
+    for (const [storedSessionId, stored] of candidateSessions) {
+      logger.info(`Trying sandbox ${stored.sandboxId} from session ${storedSessionId}`)
       try {
         const info = await this.client.getSandbox(stored.sandboxId)
+        if (info.status === 'terminated') {
+          this.removeSession(projectId, storedSessionId)
+          continue
+        }
         if (info.status === 'suspended') {
+          logger.info(`Resuming sandbox ${stored.sandboxId}`)
           await this.client.resumeSandbox(stored.sandboxId)
           await this.client.waitForRunning(stored.sandboxId)
-        } else if (info.status === 'terminated') {
-          this.removeSession(projectId, sessionId)
-          return this.getSandbox(sessionId, projectId, worktree, pluginCtx)
         } else if (info.status !== 'running') {
           await this.client.waitForRunning(stored.sandboxId)
         }
         const entry = { sandboxId: stored.sandboxId, proxyUrl: stored.proxyUrl }
         this.cache.set(sessionId, entry)
         this.updateSession(projectId, worktree, sessionId, stored.sandboxId, stored.proxyUrl)
-        toast.show({ title: 'Sandbox connected', message: 'Connected to existing sandbox.', variant: 'info' })
+        const reused = storedSessionId !== sessionId
+        toast.show({ title: 'Sandbox connected', message: reused ? 'Reusing sandbox from previous session.' : 'Connected to existing sandbox.', variant: 'info' })
         return entry
       } catch (err) {
-        logger.warn(`Failed to reconnect to sandbox ${stored.sandboxId}: ${err}`)
-        this.removeSession(projectId, sessionId)
+        logger.warn(`Failed to connect to sandbox ${stored.sandboxId}: ${err}`)
+        this.removeSession(projectId, storedSessionId)
       }
     }
 
@@ -159,6 +171,18 @@ export class TensorLakeSessionManager {
 
     toast.show({ title: 'Sandbox created', message: 'New sandbox is ready.', variant: 'success' })
     return entry
+  }
+
+  suspendAllSandboxes(): void {
+    for (const [sessionId, { sandboxId }] of this.cache.entries()) {
+      logger.info(`Suspending sandbox ${sandboxId} for session ${sessionId} (app exit)`)
+      try {
+        this.client.suspendSandboxSync(sandboxId)
+        logger.info(`Sandbox ${sandboxId} suspended`)
+      } catch (err) {
+        logger.error(`Failed to suspend sandbox ${sandboxId}: ${err}`)
+      }
+    }
   }
 
   async deleteSandbox(sessionId: string, projectId: string): Promise<void> {

@@ -1,3 +1,4 @@
+import { execFileSync } from 'child_process'
 import { logger } from './logger.js'
 
 const MANAGEMENT_API = process.env.TENSORLAKE_API_URL ?? 'https://api.tensorlake.ai'
@@ -53,12 +54,15 @@ export class TensorLakeClient {
   }
 
   async createSandbox(opts: { image?: string; timeoutSecs?: number } = {}): Promise<CreateSandboxResponse> {
+    const cpus = parseInt(process.env.TENSORLAKE_CPUS ?? '2', 10)
+    const memory_mb = parseInt(process.env.TENSORLAKE_MEMORY_MB ?? '4096', 10)
+    const ephemeral_disk_mb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
     const body = {
       image: opts.image ?? 'ubuntu:24.04',
-      resources: { cpus: 2, memory_mb: 4096, ephemeral_disk_mb: 10240 },
+      resources: { cpus, memory_mb, ephemeral_disk_mb },
       ...(opts.timeoutSecs ? { timeout_secs: opts.timeoutSecs } : {}),
     }
-    logger.info(`Creating sandbox image=${body.image}`)
+    logger.info(`Creating sandbox image=${body.image} cpus=${cpus} memory_mb=${memory_mb} disk_mb=${ephemeral_disk_mb}`)
     const res = await fetch(`${MANAGEMENT_API}/sandboxes`, {
       method: 'POST',
       headers: this.mgmtHeaders(),
@@ -92,6 +96,14 @@ export class TensorLakeClient {
     if (!res.ok) throw new Error(`Failed to suspend sandbox: ${res.status} ${await res.text()}`)
   }
 
+  suspendSandboxSync(sandboxId: string): void {
+    execFileSync('curl', [
+      '-s', '-X', 'POST',
+      `${MANAGEMENT_API}/sandboxes/${sandboxId}/suspend`,
+      '-H', `Authorization: Bearer ${this.apiKey}`,
+    ], { timeout: 10_000 })
+  }
+
   async resumeSandbox(sandboxId: string): Promise<void> {
     const res = await fetch(`${MANAGEMENT_API}/sandboxes/${sandboxId}/resume`, {
       method: 'POST',
@@ -121,7 +133,7 @@ export class TensorLakeClient {
     const startRes = await fetch(`${proxyUrl}/api/v1/processes`, {
       method: 'POST',
       headers: { ...this.proxyHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ command: 'bash', args: ['-c', command], working_dir: workingDir }),
+      body: JSON.stringify({ command: 'sh', args: ['-c', command], working_dir: workingDir }),
     })
     if (!startRes.ok) throw new Error(`Failed to start process: ${startRes.status} ${await startRes.text()}`)
     const proc = (await startRes.json()) as { pid: number; status: string }
