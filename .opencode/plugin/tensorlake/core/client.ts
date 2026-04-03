@@ -12,7 +12,7 @@ export function getSandboxProxyUrl(sandboxId: string): string {
 
 export type SandboxInfo = {
   sandbox_id: string
-  status: 'pending' | 'running' | 'snapshotting' | 'suspended' | 'terminated'
+  status: 'pending' | 'running' | 'snapshotting' | 'suspending' | 'suspended' | 'terminated'
   sandbox_url?: string
 }
 
@@ -53,16 +53,17 @@ export class TensorLakeClient {
     }
   }
 
-  async createSandbox(opts: { image?: string; timeoutSecs?: number } = {}): Promise<CreateSandboxResponse> {
+  async createSandbox(opts: { image?: string; name?: string; timeoutSecs?: number } = {}): Promise<CreateSandboxResponse> {
     const cpus = parseInt(process.env.TENSORLAKE_CPUS ?? '2', 10)
     const memory_mb = parseInt(process.env.TENSORLAKE_MEMORY_MB ?? '4096', 10)
     const ephemeral_disk_mb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
     const body = {
       image: opts.image ?? 'ubuntu:24.04',
       resources: { cpus, memory_mb, ephemeral_disk_mb },
+      ...(opts.name ? { name: opts.name } : {}),
       ...(opts.timeoutSecs ? { timeout_secs: opts.timeoutSecs } : {}),
     }
-    logger.info(`Creating sandbox image=${body.image} cpus=${cpus} memory_mb=${memory_mb} disk_mb=${ephemeral_disk_mb}`)
+    logger.info(`Creating sandbox name=${opts.name ?? '(ephemeral)'} image=${body.image} cpus=${cpus} memory_mb=${memory_mb} disk_mb=${ephemeral_disk_mb}`)
     const res = await fetch(`${MANAGEMENT_API}/sandboxes`, {
       method: 'POST',
       headers: this.mgmtHeaders(),
@@ -102,6 +103,23 @@ export class TensorLakeClient {
       `${MANAGEMENT_API}/sandboxes/${sandboxId}/suspend`,
       '-H', `Authorization: Bearer ${this.apiKey}`,
     ], { timeout: 10_000 })
+    // Poll until suspended (or timeout after 30s)
+    const deadline = Date.now() + 30_000
+    while (Date.now() < deadline) {
+      try {
+        const out = execFileSync('curl', [
+          '-s',
+          `${MANAGEMENT_API}/sandboxes/${sandboxId}`,
+          '-H', `Authorization: Bearer ${this.apiKey}`,
+        ], { timeout: 10_000 }).toString()
+        const status = JSON.parse(out)?.status
+        if (status === 'suspended' || status === 'terminated') return
+      } catch {
+        return
+      }
+      // Sleep 500ms between polls
+      execFileSync('sleep', ['0.5'])
+    }
   }
 
   async resumeSandbox(sandboxId: string): Promise<void> {
@@ -110,6 +128,15 @@ export class TensorLakeClient {
       headers: this.mgmtHeaders(),
     })
     if (!res.ok) throw new Error(`Failed to resume sandbox: ${res.status} ${await res.text()}`)
+  }
+
+  async waitForSuspended(sandboxId: string, timeoutMs = 30_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const info = await this.getSandbox(sandboxId)
+      if (info.status === 'suspended' || info.status === 'terminated') return
+      await new Promise((r) => setTimeout(r, 500))
+    }
   }
 
   async waitForRunning(sandboxId: string, timeoutMs = 60_000): Promise<void> {

@@ -10,6 +10,8 @@ export class TensorLakeSessionManager {
   private readonly client: TensorLakeClient
   // In-memory cache: sessionId -> { sandboxId, proxyUrl }
   private readonly cache = new Map<string, { sandboxId: string; proxyUrl: string }>()
+  // In-flight getSandbox promises keyed by sessionId — prevents concurrent double-resume
+  private readonly inflight = new Map<string, Promise<{ sandboxId: string; proxyUrl: string }>>()
   public readonly workDir: string
   private readonly storageDir: string
 
@@ -70,7 +72,21 @@ export class TensorLakeSessionManager {
     this.saveProjectData(data)
   }
 
-  async getSandbox(
+  getSandbox(
+    sessionId: string,
+    projectId: string,
+    worktree: string,
+    pluginCtx?: PluginInput,
+  ): Promise<{ sandboxId: string; proxyUrl: string }> {
+    const existing = this.inflight.get(sessionId)
+    if (existing) return existing
+    const promise = this._getSandbox(sessionId, projectId, worktree, pluginCtx)
+      .finally(() => this.inflight.delete(sessionId))
+    this.inflight.set(sessionId, promise)
+    return promise
+  }
+
+  private async _getSandbox(
     sessionId: string,
     projectId: string,
     worktree: string,
@@ -129,8 +145,10 @@ export class TensorLakeSessionManager {
           this.removeSession(projectId, storedSessionId)
           continue
         }
-        if (info.status === 'suspended') {
-          logger.info(`Resuming sandbox ${stored.sandboxId}`)
+        if (info.status === 'suspended' || info.status === 'suspending') {
+          logger.info(`Resuming sandbox ${stored.sandboxId} (was ${info.status})`)
+          // Wait for fully suspended before resuming
+          if (info.status === 'suspending') await this.client.waitForSuspended(stored.sandboxId)
           await this.client.resumeSandbox(stored.sandboxId)
           await this.client.waitForRunning(stored.sandboxId)
         } else if (info.status !== 'running') {
@@ -152,7 +170,9 @@ export class TensorLakeSessionManager {
     logger.info(`Creating new sandbox for session ${sessionId}`)
     const createStart = Date.now()
     const image = process.env.TENSORLAKE_IMAGE
-    const created = await this.client.createSandbox(image ? { image } : {})
+    // Sanitize session ID to a valid sandbox name (lowercase alphanumeric + hyphens, max 63 chars)
+    const sandboxName = `opencode-${sessionId}`.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 63)
+    const created = await this.client.createSandbox({ ...(image ? { image } : {}), name: sandboxName })
     logger.info(`Sandbox created ${created.sandbox_id} in ${Date.now() - createStart}ms`)
 
     await this.client.waitForRunning(created.sandbox_id)

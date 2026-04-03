@@ -14,7 +14,7 @@ When the plugin is active, OpenCode intercepts the standard tool calls (bash, re
 - **Suspension/resume** - If a sandbox is found in a suspended state it is automatically resumed before use.
 - **System prompt injection** - A block is appended to the system prompt on every request informing the model that it is operating inside a sandbox at `/workspace`.
 - **Toast notifications** - Sandbox status events (created, connected, resumed, deleted) surface as TUI toasts.
-- **Logging** - All plugin activity is written to `$XDG_DATA_HOME/opencode/log/tensorlake.log` (typically `~/.local/share/opencode/log/tensorlake.log` on Linux or `~/Library/Application Support/opencode/log/tensorlake.log` on macOS).
+- **Logging** - All plugin activity is written to `~/.local/share/opencode/log/tensorlake.log`.
 
 ### Intercepted tools
 
@@ -32,7 +32,6 @@ When the plugin is active, OpenCode intercepts the standard tool calls (bash, re
 
 ## Prerequisites
 
-- Node.js 20 or later
 - An OpenCode installation (see [opencode.ai](https://opencode.ai))
 - A TensorLake account and API key (sign up at [tensorlake.ai](https://tensorlake.ai))
 
@@ -40,30 +39,15 @@ When the plugin is active, OpenCode intercepts the standard tool calls (bash, re
 
 ## Installation & Configuration
 
-OpenCode loads plugins from its config directory (`~/.config/opencode`). Choose the option that fits your use case.
+OpenCode runs plugins as TypeScript source files directly via its embedded Bun runtime — no build step is required.
 
-### Option 1: Install from npm (recommended)
-
-```bash
-cd ~/.config/opencode
-npm install @tensorlake/opencode
-```
-
-### Option 2: Link local clone (development)
+### 1. Clone the repository
 
 ```bash
-# Build the plugin
-cd ~/Documents/git/opencode-tensorlake-plugin
-npm install
-npm run build
-
-# Create a global npm link, then link it into the OpenCode config directory
-npm link
-cd ~/.config/opencode
-npm link @tensorlake/opencode
+git clone https://github.com/tensorlakeai/opencode-tensorlake-plugin ~/opencode-tensorlake-plugin
 ```
 
-### Register the plugin with OpenCode
+### 2. Register the plugin with OpenCode
 
 Add the following to `~/.config/opencode/opencode.json` (create it if it doesn't exist):
 
@@ -71,12 +55,16 @@ Add the following to `~/.config/opencode/opencode.json` (create it if it doesn't
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "@tensorlake/opencode"
+    "file:///Users/your-username/opencode-tensorlake-plugin/.opencode/plugin/index.ts"
   ]
 }
 ```
 
-### Set your API key
+Two things are critical here:
+- The `file://` prefix is **required**. Without it OpenCode treats the value as an npm package name and tries to install it from the npm registry.
+- The path must point directly to the `.ts` entry file (`.opencode/plugin/index.ts`), not the repository root.
+
+### 3. Set your API key
 
 ```bash
 export TENSORLAKE_API_KEY=your_api_key_here
@@ -112,10 +100,6 @@ export TENSORLAKE_API_KEY=your_api_key_here
 3. Confirm the sandbox appears in the log:
 
    ```bash
-   # macOS
-   tail -f ~/Library/Application\ Support/opencode/log/tensorlake.log
-
-   # Linux
    tail -f ~/.local/share/opencode/log/tensorlake.log
    ```
 
@@ -165,6 +149,39 @@ Delete the OpenCode session from the session list. The plugin handles the `sessi
 […] [INFO] Deleting sandbox sandbox-xyz for session abc123
 […] [INFO] Sandbox sandbox-xyz deleted
 ```
+
+---
+
+## Troubleshooting
+
+### Plugin not loading
+
+Check the OpenCode server log for errors:
+
+```bash
+ls -lt ~/.local/share/opencode/log/*.log | head -3
+cat ~/.local/share/opencode/log/<latest>.log | grep -i "plugin\|error\|tensorlake"
+```
+
+**"Plugin export is not a function"** — The path in `opencode.json` points to the repository root instead of the `.ts` entry file. Make sure the path ends with `.opencode/plugin/index.ts`.
+
+**"404 failed to install plugin"** — The `file://` prefix is missing. OpenCode is trying to fetch the value as an npm package name. Add `file://` before the absolute path.
+
+### Sandbox not being used
+
+If OpenCode loads but commands run locally (not in the sandbox), the plugin tools are not being registered. Verify by checking the server log for a second round of tool registrations after the built-ins:
+
+```
+service=tool.registry status=started bash   ← built-in
+...
+service=tool.registry status=started bash   ← plugin override (should appear)
+```
+
+If the second block is absent, the plugin loaded but failed to return its hooks. Check `tensorlake.log` for errors logged during startup.
+
+### Sandbox not suspending on exit
+
+Suspension requires the sandbox to have been **named** at creation time. Sandboxes created before this was implemented (ephemeral) cannot be suspended. Delete the old session from OpenCode's session list to trigger cleanup, then create a new session — new sandboxes are always named.
 
 ---
 
