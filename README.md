@@ -76,7 +76,7 @@ export TENSORLAKE_API_KEY=your_api_key_here
 |---|---|---|
 | `TENSORLAKE_API_KEY` | (required) | Your TensorLake API key |
 | `TENSORLAKE_API_URL` | `https://api.tensorlake.ai` | Override the management API base URL |
-| `TENSORLAKE_IMAGE` | `ubuntu:24.04` | Container image to use when creating a new sandbox |
+| `TENSORLAKE_IMAGE` | `ubuntu-minimal` | Container image to use when creating a new sandbox |
 | `TENSORLAKE_CPUS` | `2` | Number of vCPUs allocated to the sandbox |
 | `TENSORLAKE_MEMORY_MB` | `4096` | RAM allocated to the sandbox in MB |
 | `TENSORLAKE_DISK_MB` | `10240` | Ephemeral disk size allocated to the sandbox in MB |
@@ -247,7 +247,7 @@ resources: { cpus: 2, memory_mb: 4096, ephemeral_disk_mb: 10240 },
 Pass `image` to `createSandbox` in `TensorLakeSessionManager.getSandbox`, or change the default in `client.ts`:
 
 ```typescript
-image: opts.image ?? 'ubuntu:24.04',
+image: opts.image ?? 'ubuntu-minimal',
 ```
 
 ### Adding new tools

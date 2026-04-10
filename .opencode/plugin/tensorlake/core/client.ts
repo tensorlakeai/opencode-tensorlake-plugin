@@ -58,7 +58,7 @@ export class TensorLakeClient {
     const memory_mb = parseInt(process.env.TENSORLAKE_MEMORY_MB ?? '4096', 10)
     const ephemeral_disk_mb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
     const body = {
-      image: opts.image ?? 'ubuntu:24.04',
+      image: opts.image ?? 'ubuntu-minimal',
       resources: { cpus, memory_mb, ephemeral_disk_mb },
       ...(opts.name ? { name: opts.name } : {}),
       ...(opts.timeoutSecs ? { timeout_secs: opts.timeoutSecs } : {}),
