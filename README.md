@@ -2,8 +2,6 @@
 
 An OpenCode plugin that runs all AI sessions inside isolated [TensorLake](https://tensorlake.ai) sandboxes. Every bash command, file read/write, and search is executed in the sandbox rather than on your local machine.
 
-This is an adaptation of the [Daytona OpenCode plugin](https://github.com/daytonaio/daytona/tree/main/libs/opencode-plugin) for TensorLake sandboxes.
-
 ---
 
 ## Overview
