@@ -15,11 +15,11 @@ export const globTool = (
     path: z.string().optional(),
   },
   async execute(args: { pattern: string; path?: string }, ctx: ToolContext) {
-    const { proxyUrl } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
     const searchPath = args.path ?? sessionManager.workDir
     const result = await sessionManager
       .getClient()
-      .executeCommand(proxyUrl, `find ${searchPath} -name "${args.pattern}" 2>/dev/null`, '/')
+      .executeCommand(sandboxId, `find ${searchPath} -name "${args.pattern}" 2>/dev/null`, '/')
     return result.stdout.trim() || '(no matches)'
   },
 })

@@ -15,14 +15,13 @@ export const writeTool = (
     content: z.string(),
   },
   async execute(args: { filePath: string; content: string }, ctx: ToolContext) {
-    const { proxyUrl } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
     const buf = Buffer.from(args.content)
-    // Ensure parent directory exists
     const dir = args.filePath.split('/').slice(0, -1).join('/')
     if (dir) {
-      await sessionManager.getClient().executeCommand(proxyUrl, `mkdir -p ${dir}`, '/').catch(() => {})
+      await sessionManager.getClient().executeCommand(sandboxId, `mkdir -p ${dir}`, '/').catch(() => {})
     }
-    await sessionManager.getClient().writeFile(proxyUrl, args.filePath, buf)
+    await sessionManager.getClient().writeFile(sandboxId, args.filePath, buf)
     return `Written ${buf.length} bytes to ${args.filePath}`
   },
 })

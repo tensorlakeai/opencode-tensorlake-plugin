@@ -31,3 +31,4 @@ Thumbs.db
 # Package manager locks (keep package-lock.json, ignore others)
 yarn.lock
 pnpm-lock.yaml
+.tensorlake/

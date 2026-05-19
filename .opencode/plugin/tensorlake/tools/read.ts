@@ -14,8 +14,8 @@ export const readTool = (
     filePath: z.string(),
   },
   async execute(args: { filePath: string }, ctx: ToolContext) {
-    const { proxyUrl } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
-    const buffer = await sessionManager.getClient().readFile(proxyUrl, args.filePath)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
+    const buffer = await sessionManager.getClient().readFile(sandboxId, args.filePath)
     return new TextDecoder().decode(buffer)
   },
 })

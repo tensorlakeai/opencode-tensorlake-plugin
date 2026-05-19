@@ -15,17 +15,16 @@ export const bashTool = (
     background: z.boolean().optional(),
   },
   async execute(args: { command: string; background?: boolean }, ctx: ToolContext) {
-    const { proxyUrl } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
     const client = sessionManager.getClient()
     const workDir = sessionManager.workDir
 
     if (args.background) {
-      // Fire and forget - start the process but don't wait
-      client.executeCommand(proxyUrl, args.command, workDir, 300_000).catch(() => {})
+      client.executeCommand(sandboxId, args.command, workDir, 300_000).catch(() => {})
       return `Command started in background: ${args.command}`
     }
 
-    const result = await client.executeCommand(proxyUrl, args.command, workDir)
+    const result = await client.executeCommand(sandboxId, args.command, workDir)
     const output = [result.stdout, result.stderr].filter(Boolean).join('\n')
     return `Exit code: ${result.exitCode}\n${output}`
   },

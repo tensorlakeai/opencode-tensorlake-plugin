@@ -10,7 +10,7 @@ import { systemPromptTransform } from './plugins/system-transform.js'
 
 const LOG_FILE = join(xdgData ?? '/tmp', 'opencode', 'log', 'tensorlake.log')
 const STORAGE_DIR = join(xdgData ?? '/tmp', 'opencode', 'storage', 'tensorlake')
-const WORK_DIR = '/workspace'
+const WORK_DIR = '/tmp/workspace'
 
 setLogFilePath(LOG_FILE)
 const sessionManager = new TensorLakeSessionManager(

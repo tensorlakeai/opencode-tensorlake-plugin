@@ -1,19 +1,19 @@
+import { SandboxClient } from 'tensorlake'
+import type { Sandbox } from 'tensorlake'
 import { execFileSync } from 'child_process'
 import { logger } from './logger.js'
 
 const MANAGEMENT_API = process.env.TENSORLAKE_API_URL ?? 'https://api.tensorlake.ai'
 
-export function getSandboxProxyUrl(sandboxId: string): string {
-  const base = process.env.TENSORLAKE_SANDBOX_PROXY_URL ?? 'https://sandbox.tensorlake.ai'
-  // If custom env var is set, use it directly; otherwise construct subdomain URL
-  if (process.env.TENSORLAKE_SANDBOX_PROXY_URL) return base
+function getSandboxProxyUrl(sandboxId: string): string {
+  const custom = process.env.TENSORLAKE_SANDBOX_PROXY_URL
+  if (custom) return custom
   return `https://${sandboxId}.sandbox.tensorlake.ai`
 }
 
 export type SandboxInfo = {
   sandbox_id: string
-  status: 'pending' | 'running' | 'snapshotting' | 'suspending' | 'suspended' | 'terminated'
-  sandbox_url?: string
+  status: string
 }
 
 export type CreateSandboxResponse = {
@@ -34,67 +34,53 @@ export type DirectoryEntry = {
 }
 
 export class TensorLakeClient {
-  constructor(private readonly apiKey: string) {}
+  private readonly sdk: SandboxClient
+
+  constructor(private readonly apiKey: string) {
+    this.sdk = SandboxClient.forCloud({
+      apiKey,
+      apiUrl: MANAGEMENT_API,
+      organizationId: process.env.TENSORLAKE_ORGANIZATION_ID,
+      projectId: process.env.TENSORLAKE_PROJECT_ID,
+    })
+  }
 
   hasApiKey(): boolean {
     return this.apiKey.length > 0
   }
 
-  private mgmtHeaders() {
-    return {
-      Authorization: `Bearer ${this.apiKey}`,
-      'Content-Type': 'application/json',
-    }
-  }
-
-  private proxyHeaders() {
-    return {
-      Authorization: `Bearer ${this.apiKey}`,
-    }
-  }
-
   async createSandbox(opts: { image?: string; name?: string; timeoutSecs?: number } = {}): Promise<CreateSandboxResponse> {
-    const cpus = parseInt(process.env.TENSORLAKE_CPUS ?? '2', 10)
-    const memory_mb = parseInt(process.env.TENSORLAKE_MEMORY_MB ?? '4096', 10)
-    const ephemeral_disk_mb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
-    const body = {
-      image: opts.image ?? 'ubuntu-minimal',
-      resources: { cpus, memory_mb, ephemeral_disk_mb },
+    const cpus = parseFloat(process.env.TENSORLAKE_CPUS ?? '2')
+    const memoryMb = parseInt(process.env.TENSORLAKE_MEMORY_MB ?? '4096', 10)
+    const ephemeralDiskMb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
+    logger.info(`Creating sandbox name=${opts.name ?? '(ephemeral)'} image=${opts.image ?? '(default)'} cpus=${cpus} memoryMb=${memoryMb} diskMb=${ephemeralDiskMb}`)
+    const sandbox = await this.sdk.createAndConnect({
+      ...(opts.image ? { image: opts.image } : {}),
+      cpus,
+      memoryMb,
+      diskMb: ephemeralDiskMb,
       ...(opts.name ? { name: opts.name } : {}),
-      ...(opts.timeoutSecs ? { timeout_secs: opts.timeoutSecs } : {}),
-    }
-    logger.info(`Creating sandbox name=${opts.name ?? '(ephemeral)'} image=${body.image} cpus=${cpus} memory_mb=${memory_mb} disk_mb=${ephemeral_disk_mb}`)
-    const res = await fetch(`${MANAGEMENT_API}/sandboxes`, {
-      method: 'POST',
-      headers: this.mgmtHeaders(),
-      body: JSON.stringify(body),
+      ...(opts.timeoutSecs ? { timeoutSecs: opts.timeoutSecs } : {}),
     })
-    if (!res.ok) throw new Error(`Failed to create sandbox: ${res.status} ${await res.text()}`)
-    return res.json() as Promise<CreateSandboxResponse>
+    return { sandbox_id: sandbox.sandboxId, status: 'running' }
   }
 
   async getSandbox(sandboxId: string): Promise<SandboxInfo> {
-    const res = await fetch(`${MANAGEMENT_API}/sandboxes/${sandboxId}`, {
-      headers: this.mgmtHeaders(),
-    })
-    if (!res.ok) throw new Error(`Failed to get sandbox ${sandboxId}: ${res.status} ${await res.text()}`)
-    return res.json() as Promise<SandboxInfo>
+    const info = await this.sdk.get(sandboxId)
+    return { sandbox_id: info.sandboxId, status: info.status as unknown as string }
   }
 
   async deleteSandbox(sandboxId: string): Promise<void> {
-    const res = await fetch(`${MANAGEMENT_API}/sandboxes/${sandboxId}`, {
-      method: 'DELETE',
-      headers: this.mgmtHeaders(),
-    })
-    if (!res.ok && res.status !== 404) throw new Error(`Failed to delete sandbox: ${res.status} ${await res.text()}`)
+    try {
+      await this.sdk.delete(sandboxId)
+    } catch (err: unknown) {
+      if (String((err as Error)?.message ?? err).includes('404')) return
+      throw err
+    }
   }
 
   async suspendSandbox(sandboxId: string): Promise<void> {
-    const res = await fetch(`${MANAGEMENT_API}/sandboxes/${sandboxId}/suspend`, {
-      method: 'POST',
-      headers: this.mgmtHeaders(),
-    })
-    if (!res.ok) throw new Error(`Failed to suspend sandbox: ${res.status} ${await res.text()}`)
+    await this.sdk.suspend(sandboxId)
   }
 
   suspendSandboxSync(sandboxId: string): void {
@@ -103,7 +89,6 @@ export class TensorLakeClient {
       `${MANAGEMENT_API}/sandboxes/${sandboxId}/suspend`,
       '-H', `Authorization: Bearer ${this.apiKey}`,
     ], { timeout: 10_000 })
-    // Poll until suspended (or timeout after 30s)
     const deadline = Date.now() + 30_000
     while (Date.now() < deadline) {
       try {
@@ -117,17 +102,12 @@ export class TensorLakeClient {
       } catch {
         return
       }
-      // Sleep 500ms between polls
       execFileSync('sleep', ['0.5'])
     }
   }
 
   async resumeSandbox(sandboxId: string): Promise<void> {
-    const res = await fetch(`${MANAGEMENT_API}/sandboxes/${sandboxId}/resume`, {
-      method: 'POST',
-      headers: this.mgmtHeaders(),
-    })
-    if (!res.ok) throw new Error(`Failed to resume sandbox: ${res.status} ${await res.text()}`)
+    await this.sdk.resume(sandboxId)
   }
 
   async waitForSuspended(sandboxId: string, timeoutMs = 30_000): Promise<void> {
@@ -150,91 +130,47 @@ export class TensorLakeClient {
     throw new Error(`Sandbox ${sandboxId} did not become running within ${timeoutMs}ms`)
   }
 
+  private connectSandbox(sandboxId: string): Sandbox {
+    return this.sdk.connect(sandboxId, getSandboxProxyUrl(sandboxId))
+  }
+
   async executeCommand(
-    proxyUrl: string,
+    sandboxId: string,
     command: string,
-    workingDir = '/workspace',
+    workingDir = '/tmp/workspace',
     timeoutMs = 120_000,
   ): Promise<ProcessResult> {
-    // Start process
-    const startRes = await fetch(`${proxyUrl}/api/v1/processes`, {
-      method: 'POST',
-      headers: { ...this.proxyHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ command: 'sh', args: ['-c', command], working_dir: workingDir }),
+    const sandbox = this.connectSandbox(sandboxId)
+    const result = await sandbox.run('sh', {
+      args: ['-c', command],
+      workingDir,
+      timeout: timeoutMs / 1000,
     })
-    if (!startRes.ok) throw new Error(`Failed to start process: ${startRes.status} ${await startRes.text()}`)
-    const proc = (await startRes.json()) as { pid: number; status: string }
-
-    // Poll until complete
-    const deadline = Date.now() + timeoutMs
-    let procInfo: { pid: number; status: string; exit_code?: number } = proc
-    while (procInfo.status === 'running') {
-      if (Date.now() > deadline) {
-        // Kill the process
-        await fetch(`${proxyUrl}/api/v1/processes/${proc.pid}/signal`, {
-          method: 'POST',
-          headers: { ...this.proxyHeaders(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ signal: 9 }),
-        }).catch(() => {})
-        throw new Error(`Command timed out after ${timeoutMs}ms`)
-      }
-      await new Promise((r) => setTimeout(r, 100))
-      const pollRes = await fetch(`${proxyUrl}/api/v1/processes/${proc.pid}`, {
-        headers: this.proxyHeaders(),
-      })
-      if (!pollRes.ok) break
-      procInfo = (await pollRes.json()) as { pid: number; status: string; exit_code?: number }
-    }
-
-    // Get output
-    const [stdoutRes, stderrRes] = await Promise.all([
-      fetch(`${proxyUrl}/api/v1/processes/${proc.pid}/stdout`, { headers: this.proxyHeaders() }),
-      fetch(`${proxyUrl}/api/v1/processes/${proc.pid}/stderr`, { headers: this.proxyHeaders() }),
-    ])
-
-    const stdoutData = stdoutRes.ok ? ((await stdoutRes.json()) as { lines: string[] }) : { lines: [] }
-    const stderrData = stderrRes.ok ? ((await stderrRes.json()) as { lines: string[] }) : { lines: [] }
-
     return {
-      exitCode: procInfo.exit_code ?? -1,
-      stdout: stdoutData.lines.join('\n'),
-      stderr: stderrData.lines.join('\n'),
+      exitCode: result.exitCode ?? -1,
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? '',
     }
   }
 
-  async readFile(proxyUrl: string, path: string): Promise<Buffer> {
-    const res = await fetch(`${proxyUrl}/api/v1/files?path=${encodeURIComponent(path)}`, {
-      headers: this.proxyHeaders(),
-    })
-    if (!res.ok) throw new Error(`Failed to read file ${path}: ${res.status} ${await res.text()}`)
-    const buf = await res.arrayBuffer()
-    return Buffer.from(buf)
+  async readFile(sandboxId: string, path: string): Promise<Buffer> {
+    const sandbox = this.connectSandbox(sandboxId)
+    const data = await sandbox.readFile(path)
+    return Buffer.from(data)
   }
 
-  async writeFile(proxyUrl: string, path: string, content: Buffer): Promise<void> {
-    const res = await fetch(`${proxyUrl}/api/v1/files?path=${encodeURIComponent(path)}`, {
-      method: 'PUT',
-      headers: { ...this.proxyHeaders(), 'Content-Type': 'application/octet-stream' },
-      body: content as unknown as BodyInit,
-    })
-    if (!res.ok) throw new Error(`Failed to write file ${path}: ${res.status} ${await res.text()}`)
+  async writeFile(sandboxId: string, path: string, content: Buffer): Promise<void> {
+    const sandbox = this.connectSandbox(sandboxId)
+    await sandbox.writeFile(path, content)
   }
 
-  async listDirectory(proxyUrl: string, path: string): Promise<DirectoryEntry[]> {
-    const res = await fetch(`${proxyUrl}/api/v1/files/list?path=${encodeURIComponent(path)}`, {
-      headers: this.proxyHeaders(),
-    })
-    if (!res.ok) throw new Error(`Failed to list directory ${path}: ${res.status} ${await res.text()}`)
-    const data = (await res.json()) as { path: string; entries: DirectoryEntry[] }
-    return data.entries
-  }
-
-  async health(proxyUrl: string): Promise<boolean> {
-    try {
-      const res = await fetch(`${proxyUrl}/api/v1/health`, { headers: this.proxyHeaders() })
-      return res.ok
-    } catch {
-      return false
-    }
+  async listDirectory(sandboxId: string, path: string): Promise<DirectoryEntry[]> {
+    const sandbox = this.connectSandbox(sandboxId)
+    const response = await sandbox.listDirectory(path)
+    return response.entries.map((e) => ({
+      name: e.name,
+      is_dir: e.isDir,
+      size: e.size,
+    }))
   }
 }

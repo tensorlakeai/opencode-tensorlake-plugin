@@ -16,12 +16,12 @@ export const editTool = (
     newString: z.string(),
   },
   async execute(args: { filePath: string; oldString: string; newString: string }, ctx: ToolContext) {
-    const { proxyUrl } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
     const client = sessionManager.getClient()
-    const buffer = await client.readFile(proxyUrl, args.filePath)
+    const buffer = await client.readFile(sandboxId, args.filePath)
     const content = new TextDecoder().decode(buffer)
     const newContent = content.replace(args.oldString, args.newString)
-    await client.writeFile(proxyUrl, args.filePath, Buffer.from(newContent))
+    await client.writeFile(sandboxId, args.filePath, Buffer.from(newContent))
     return `Edited ${args.filePath}`
   },
 })

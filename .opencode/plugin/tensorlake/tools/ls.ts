@@ -14,9 +14,9 @@ export const lsTool = (
     dirPath: z.string().optional(),
   },
   async execute(args: { dirPath?: string }, ctx: ToolContext) {
-    const { proxyUrl } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
     const path = args.dirPath ?? sessionManager.workDir
-    const entries = await sessionManager.getClient().listDirectory(proxyUrl, path)
+    const entries = await sessionManager.getClient().listDirectory(sandboxId, path)
     return entries.map((e) => (e.is_dir ? `${e.name}/` : e.name)).join('\n')
   },
 })

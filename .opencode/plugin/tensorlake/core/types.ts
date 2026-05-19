@@ -37,7 +37,7 @@ export type SandboxRecord = {
 
 export type SessionInfo = {
   sandboxId: string
-  proxyUrl: string
+  proxyUrl?: string
   created: number
   lastAccessed: number
 }

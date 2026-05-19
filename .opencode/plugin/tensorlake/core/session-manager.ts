@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
-import { TensorLakeClient, getSandboxProxyUrl } from './client.js'
+import { TensorLakeClient } from './client.js'
 import { logger } from './logger.js'
 import { toast } from './toast.js'
 import type { ProjectSessionData } from './types.js'
@@ -8,10 +8,10 @@ import type { PluginInput } from '@opencode-ai/plugin'
 
 export class TensorLakeSessionManager {
   private readonly client: TensorLakeClient
-  // In-memory cache: sessionId -> { sandboxId, proxyUrl }
-  private readonly cache = new Map<string, { sandboxId: string; proxyUrl: string }>()
+  // In-memory cache: sessionId -> { sandboxId }
+  private readonly cache = new Map<string, { sandboxId: string }>()
   // In-flight getSandbox promises keyed by sessionId — prevents concurrent double-resume
-  private readonly inflight = new Map<string, Promise<{ sandboxId: string; proxyUrl: string }>>()
+  private readonly inflight = new Map<string, Promise<{ sandboxId: string }>>()
   public readonly workDir: string
   private readonly storageDir: string
 
@@ -53,12 +53,10 @@ export class TensorLakeSessionManager {
     worktree: string,
     sessionId: string,
     sandboxId: string,
-    proxyUrl: string,
   ): void {
     const existing = this.loadProjectData(projectId) ?? { projectId, worktree, sessions: {} }
     existing.sessions[sessionId] = {
       sandboxId,
-      proxyUrl,
       created: existing.sessions[sessionId]?.created ?? Date.now(),
       lastAccessed: Date.now(),
     }
@@ -77,7 +75,7 @@ export class TensorLakeSessionManager {
     projectId: string,
     worktree: string,
     pluginCtx?: PluginInput,
-  ): Promise<{ sandboxId: string; proxyUrl: string }> {
+  ): Promise<{ sandboxId: string }> {
     const existing = this.inflight.get(sessionId)
     if (existing) return existing
     const promise = this._getSandbox(sessionId, projectId, worktree, pluginCtx)
@@ -91,7 +89,7 @@ export class TensorLakeSessionManager {
     projectId: string,
     worktree: string,
     pluginCtx?: PluginInput,
-  ): Promise<{ sandboxId: string; proxyUrl: string }> {
+  ): Promise<{ sandboxId: string }> {
     if (pluginCtx?.client?.tui) toast.initialize(pluginCtx.client.tui)
 
     if (!this.client.hasApiKey()) {
@@ -103,7 +101,6 @@ export class TensorLakeSessionManager {
     // Check in-memory cache
     const cached = this.cache.get(sessionId)
     if (cached) {
-      // Verify it's still running
       try {
         const info = await this.client.getSandbox(cached.sandboxId)
         if (info.status === 'suspended') {
@@ -117,7 +114,7 @@ export class TensorLakeSessionManager {
           this.removeSession(projectId, sessionId)
           return this.getSandbox(sessionId, projectId, worktree, pluginCtx)
         }
-        this.updateSession(projectId, worktree, sessionId, cached.sandboxId, cached.proxyUrl)
+        this.updateSession(projectId, worktree, sessionId, cached.sandboxId)
         return cached
       } catch (err) {
         logger.warn(`Failed to check cached sandbox: ${err}`)
@@ -129,7 +126,6 @@ export class TensorLakeSessionManager {
     const projectData = this.loadProjectData(projectId)
     const candidateSessions = projectData
       ? [
-          // Session-specific entry first, then all others (most recently accessed first)
           ...(projectData.sessions[sessionId] ? [[sessionId, projectData.sessions[sessionId]] as const] : []),
           ...Object.entries(projectData.sessions)
             .filter(([id]) => id !== sessionId)
@@ -147,16 +143,15 @@ export class TensorLakeSessionManager {
         }
         if (info.status === 'suspended' || info.status === 'suspending') {
           logger.info(`Resuming sandbox ${stored.sandboxId} (was ${info.status})`)
-          // Wait for fully suspended before resuming
           if (info.status === 'suspending') await this.client.waitForSuspended(stored.sandboxId)
           await this.client.resumeSandbox(stored.sandboxId)
           await this.client.waitForRunning(stored.sandboxId)
         } else if (info.status !== 'running') {
           await this.client.waitForRunning(stored.sandboxId)
         }
-        const entry = { sandboxId: stored.sandboxId, proxyUrl: stored.proxyUrl }
+        const entry = { sandboxId: stored.sandboxId }
         this.cache.set(sessionId, entry)
-        this.updateSession(projectId, worktree, sessionId, stored.sandboxId, stored.proxyUrl)
+        this.updateSession(projectId, worktree, sessionId, stored.sandboxId)
         const reused = storedSessionId !== sessionId
         toast.show({ title: 'Sandbox connected', message: reused ? 'Reusing sandbox from previous session.' : 'Connected to existing sandbox.', variant: 'info' })
         return entry
@@ -170,24 +165,20 @@ export class TensorLakeSessionManager {
     logger.info(`Creating new sandbox for session ${sessionId}`)
     const createStart = Date.now()
     const image = process.env.TENSORLAKE_IMAGE
-    // Sanitize session ID to a valid sandbox name (lowercase alphanumeric + hyphens, max 63 chars)
     const sandboxName = `opencode-${sessionId}`.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 63)
     const created = await this.client.createSandbox({ ...(image ? { image } : {}), name: sandboxName })
     logger.info(`Sandbox created ${created.sandbox_id} in ${Date.now() - createStart}ms`)
 
-    await this.client.waitForRunning(created.sandbox_id)
-
-    // Ensure workspace dir exists
-    const proxyUrl = getSandboxProxyUrl(created.sandbox_id)
+    // createAndConnect already waits for running; ensure workspace dir exists
     try {
-      await this.client.executeCommand(proxyUrl, `mkdir -p ${this.workDir}`, '/')
+      await this.client.executeCommand(created.sandbox_id, `mkdir -p ${this.workDir}`, '/')
     } catch (err) {
       logger.warn(`Failed to create workspace dir: ${err}`)
     }
 
-    const entry = { sandboxId: created.sandbox_id, proxyUrl }
+    const entry = { sandboxId: created.sandbox_id }
     this.cache.set(sessionId, entry)
-    this.updateSession(projectId, worktree, sessionId, created.sandbox_id, proxyUrl)
+    this.updateSession(projectId, worktree, sessionId, created.sandbox_id)
 
     toast.show({ title: 'Sandbox created', message: 'New sandbox is ready.', variant: 'success' })
     return entry
