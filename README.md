@@ -10,7 +10,7 @@ When the plugin is active, OpenCode intercepts the standard tool calls (bash, re
 
 - **Sandbox lifecycle** - A sandbox is created on the first tool call in a session and deleted when the session is deleted. Sandbox state is persisted to disk so that reconnection is possible across OpenCode restarts.
 - **Suspension/resume** - If a sandbox is found in a suspended state it is automatically resumed before use.
-- **System prompt injection** - A block is appended to the system prompt on every request informing the model that it is operating inside a sandbox at `/workspace`.
+- **System prompt injection** - A block is appended to the system prompt on every request informing the model that it is operating inside a sandbox at `/tmp/workspace`.
 - **Toast notifications** - Sandbox status events (created, connected, resumed, deleted) surface as TUI toasts.
 - **Logging** - All plugin activity is written to `~/.local/share/opencode/log/tensorlake.log`.
 
@@ -18,11 +18,11 @@ When the plugin is active, OpenCode intercepts the standard tool calls (bash, re
 
 | OpenCode tool | Sandbox implementation |
 |---|---|
-| `bash` | `POST /api/v1/processes` then poll until exit, collect stdout/stderr |
-| `read` | `GET /api/v1/files?path=…` |
-| `write` | `PUT /api/v1/files?path=…` |
+| `bash` | `sandbox.run('sh', { args: ['-c', cmd] })` via SDK |
+| `read` | `sandbox.readFile(path)` via SDK |
+| `write` | `sandbox.writeFile(path, content)` via SDK |
 | `edit` | read + string replace + write |
-| `ls` | `GET /api/v1/files/list?path=…` |
+| `ls` | `sandbox.listDirectory(path)` via SDK |
 | `glob` | `find … -name "pattern"` via bash |
 | `grep` | `grep -rn …` via bash |
 
@@ -73,8 +73,10 @@ export TENSORLAKE_API_KEY=your_api_key_here
 | Variable | Default | Description |
 |---|---|---|
 | `TENSORLAKE_API_KEY` | (required) | Your TensorLake API key |
+| `TENSORLAKE_ORGANIZATION_ID` | (required for PAT keys) | Organization ID (e.g. `org_…`). Required when using a Personal Access Token; not needed for project-scoped keys. |
+| `TENSORLAKE_PROJECT_ID` | (required for PAT keys) | Project ID (e.g. `project_…`). Required when using a Personal Access Token; not needed for project-scoped keys. |
 | `TENSORLAKE_API_URL` | `https://api.tensorlake.ai` | Override the management API base URL |
-| `TENSORLAKE_IMAGE` | `ubuntu-minimal` | Container image to use when creating a new sandbox |
+| `TENSORLAKE_IMAGE` | (server default) | Container image to use when creating a new sandbox. Leave unset to use the platform default. |
 | `TENSORLAKE_CPUS` | `2` | Number of vCPUs allocated to the sandbox |
 | `TENSORLAKE_MEMORY_MB` | `4096` | RAM allocated to the sandbox in MB |
 | `TENSORLAKE_DISK_MB` | `10240` | Ephemeral disk size allocated to the sandbox in MB |
@@ -122,26 +124,26 @@ The model will call the `bash` tool. Because the plugin intercepts it, the comma
 ### File read/write test
 
 ```
-Write the text "Hello TensorLake" to /workspace/test.txt, then read it back.
+Write the text "Hello TensorLake" to /tmp/workspace/test.txt, then read it back.
 ```
 
 The model will:
-1. Call `write` with `filePath=/workspace/test.txt` → proxied to `PUT /api/v1/files`
-2. Call `read` with `filePath=/workspace/test.txt` → proxied to `GET /api/v1/files`
+1. Call `write` with `filePath=/tmp/workspace/test.txt` → routed to `sandbox.writeFile()` via SDK
+2. Call `read` with `filePath=/tmp/workspace/test.txt` → routed to `sandbox.readFile()` via SDK
 
 The response should echo back `Hello TensorLake`.
 
 ### Directory listing test
 
 ```
-List the files in /workspace
+List the files in /tmp/workspace
 ```
 
-This triggers the `ls` tool, which calls `GET /api/v1/files/list?path=/workspace` on the sandbox proxy.
+This triggers the `ls` tool, which calls `sandbox.listDirectory('/tmp/workspace')` via the SDK.
 
 ### Verifying sandbox deletion
 
-Delete the OpenCode session from the session list. The plugin handles the `session.deleted` event and calls `DELETE /sandboxes/{id}` on the management API. Confirm in the log:
+Delete the OpenCode session from the session list. The plugin handles the `session.deleted` event and calls `sdk.delete(sandboxId)` via the TensorLake SDK. Confirm in the log:
 
 ```
 […] [INFO] Deleting sandbox sandbox-xyz for session abc123
@@ -199,7 +201,7 @@ opencode-tensorlake-plugin/
             ├── index.ts                      # plugin factory
             ├── tools.ts                      # assembles all tools
             ├── core/
-            │   ├── client.ts                 # TensorLake REST API client
+            │   ├── client.ts                 # TensorLake SDK client (SandboxClient wrapper)
             │   ├── logger.ts                 # file-based logger with rotation
             │   ├── session-manager.ts        # sandbox lifecycle management
             │   ├── toast.ts                  # TUI toast queue
@@ -234,18 +236,34 @@ Output is emitted to `dist/` with declaration files. The `tsconfig.lib.json` set
 
 ### Modifying sandbox resources
 
-To change the default CPU/memory/disk allocation, edit the `resources` object in `TensorLakeClient.createSandbox` inside `.opencode/plugin/tensorlake/core/client.ts`:
+To change the default CPU/memory/disk allocation, set environment variables before starting OpenCode:
+
+```bash
+export TENSORLAKE_CPUS=4
+export TENSORLAKE_MEMORY_MB=8192
+export TENSORLAKE_DISK_MB=20480
+```
+
+Or edit the defaults directly in `TensorLakeClient.createSandbox` inside `.opencode/plugin/tensorlake/core/client.ts`:
 
 ```typescript
-resources: { cpus: 2, memory_mb: 4096, ephemeral_disk_mb: 10240 },
+const cpus = parseFloat(process.env.TENSORLAKE_CPUS ?? '2')
+const memoryMb = parseInt(process.env.TENSORLAKE_MEMORY_MB ?? '4096', 10)
+const ephemeralDiskMb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
 ```
 
 ### Changing the default sandbox image
 
-Pass `image` to `createSandbox` in `TensorLakeSessionManager.getSandbox`, or change the default in `client.ts`:
+Set `TENSORLAKE_IMAGE` to a registered image name before starting OpenCode:
 
-```typescript
-image: opts.image ?? 'ubuntu-minimal',
+```bash
+export TENSORLAKE_IMAGE=my-custom-image
+```
+
+When unset, the platform's default image is used. To register a custom image:
+
+```bash
+tl sbx image create Dockerfile --registered-name my-custom-image
 ```
 
 ### Adding new tools
