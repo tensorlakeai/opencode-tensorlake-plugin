@@ -1,4 +1,4 @@
-# @tensorlake/opencode
+# tensorlake-opencode
 
 An OpenCode plugin that runs all AI sessions inside isolated [TensorLake](https://tensorlake.ai) sandboxes. Every bash command, file read/write, and search is executed in the sandbox rather than on your local machine.
 
@@ -37,17 +37,54 @@ When the plugin is active, OpenCode intercepts the standard tool calls (bash, re
 
 ## Installation & Configuration
 
-OpenCode runs plugins as TypeScript source files directly via its embedded Bun runtime — no build step is required.
+OpenCode can install plugins directly from npm. Use the npm package name in your OpenCode config unless you are developing the plugin locally.
 
-### 1. Clone the repository
+### 1. Install from npm
+
+Add the plugin package name to `~/.config/opencode/opencode.json` (create it if it doesn't exist):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "tensorlake-opencode"
+  ]
+}
+```
+
+OpenCode treats bare plugin names as npm packages, so it will install `tensorlake-opencode` from the npm registry.
+
+You can list multiple plugins in the same array:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "tensorlake-opencode",
+    "opencode-helicone-session",
+    "opencode-wakatime",
+    "@my-org/custom-plugin"
+  ]
+}
+```
+
+### 2. Set your API key
+
+```bash
+export TENSORLAKE_API_KEY=your_api_key_here
+```
+
+### Local development install
+
+OpenCode can also run plugins as TypeScript source files directly via its embedded Bun runtime. Use this option when you are modifying this repository locally.
+
+Clone the repository:
 
 ```bash
 git clone https://github.com/tensorlakeai/opencode-tensorlake-plugin ~/opencode-tensorlake-plugin
 ```
 
-### 2. Register the plugin with OpenCode
-
-Add the following to `~/.config/opencode/opencode.json` (create it if it doesn't exist):
+Then point OpenCode at the plugin entry file:
 
 ```json
 {
@@ -58,15 +95,9 @@ Add the following to `~/.config/opencode/opencode.json` (create it if it doesn't
 }
 ```
 
-Two things are critical here:
-- The `file://` prefix is **required**. Without it OpenCode treats the value as an npm package name and tries to install it from the npm registry.
+For local paths:
+- The `file://` prefix is required. Without it, OpenCode treats the value as an npm package name.
 - The path must point directly to the `.ts` entry file (`.opencode/plugin/index.ts`), not the repository root.
-
-### 3. Set your API key
-
-```bash
-export TENSORLAKE_API_KEY=your_api_key_here
-```
 
 ### Environment variables
 
@@ -165,7 +196,7 @@ cat ~/.local/share/opencode/log/<latest>.log | grep -i "plugin\|error\|tensorlak
 
 **"Plugin export is not a function"** — The path in `opencode.json` points to the repository root instead of the `.ts` entry file. Make sure the path ends with `.opencode/plugin/index.ts`.
 
-**"404 failed to install plugin"** — The `file://` prefix is missing. OpenCode is trying to fetch the value as an npm package name. Add `file://` before the absolute path.
+**"404 failed to install plugin"** — For npm installs, verify the package name is `tensorlake-opencode`. For local development installs, this usually means the `file://` prefix is missing and OpenCode is trying to fetch your local path as an npm package name. Add `file://` before the absolute path.
 
 ### Sandbox not being used
 
