@@ -18,7 +18,7 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.15.5",
-    "tensorlake": "^0.5.14",
+    "tensorlake": "0.5.30",
     "xdg-basedir": "^5.1.0",
     "zod": "^4.2.1"
   },
