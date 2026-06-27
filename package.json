@@ -1,6 +1,6 @@
 {
   "name": "tensorlake-opencode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "Apache-2.0",
   "description": "OpenCode plugin that runs all sessions in TensorLake sandboxes for isolated execution environments",
   "keywords": [
@@ -12,6 +12,9 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "type": "module",
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.lib.json",
     "type-check": "tsc -p tsconfig.json --noEmit"

@@ -6,9 +6,11 @@ An OpenCode plugin that runs all AI sessions inside isolated [TensorLake](https:
 
 ## Overview
 
-When the plugin is active, OpenCode intercepts the standard tool calls (bash, read, write, edit, ls, glob, grep) and routes them to a TensorLake sandbox:
+When the plugin is active, OpenCode intercepts the standard tool calls (bash, read, write, edit, ls, glob, grep) and routes them to a TensorLake sandbox.
 
-- **Sandbox lifecycle** - A sandbox is created on the first tool call in a session and deleted when the session is deleted. Sandbox state is persisted to disk so that reconnection is possible across OpenCode restarts.
+> **No sandbox is created when you start OpenCode.** The sandbox is provisioned lazily on the model's first tool call in a session. If you launch OpenCode and nothing seems to happen, that's expected — ask the model to run a command to spin one up.
+
+- **Sandbox lifecycle** - A sandbox is created lazily on the **first intercepted tool call** in a session (not at launch) and deleted when the session is deleted. Sandbox state is persisted to disk so that reconnection is possible across OpenCode restarts.
 - **Suspension/resume** - If a sandbox is found in a suspended state it is automatically resumed before use.
 - **System prompt injection** - A block is appended to the system prompt on every request informing the model that it is operating inside a sandbox at `/tmp/workspace`.
 - **Toast notifications** - Sandbox status events (created, connected, resumed, deleted) surface as TUI toasts.
@@ -126,20 +128,25 @@ For local paths:
    opencode
    ```
 
-2. After OpenCode loads you should see a toast notification: **"Sandbox created - New sandbox is ready."**
-
-3. Confirm the sandbox appears in the log:
+2. After OpenCode loads, the plugin is active but **no sandbox exists yet** — sandboxes are created on the first intercepted tool call, not at startup. Confirm the plugin loaded by tailing its log:
 
    ```bash
    tail -f ~/.local/share/opencode/log/tensorlake.log
    ```
 
-   You should see lines like:
+   On startup you should see a single line:
 
    ```
    [2024-01-15T10:00:01.000Z] [INFO] OpenCode started with TensorLake plugin
-   [2024-01-15T10:00:01.200Z] [INFO] Creating new sandbox for session abc123
-   [2024-01-15T10:00:03.500Z] [INFO] Sandbox created sandbox-xyz in 2300ms
+   ```
+
+   If this file doesn't exist after launch, the plugin never loaded — see [Plugin not loading](#plugin-not-loading).
+
+3. Trigger sandbox creation by asking the model to run something (see the bash test below). The first tool call provisions the sandbox; you'll then see a toast — **"Sandbox created - New sandbox is ready."** — and new log lines:
+
+   ```
+   [2024-01-15T10:00:30.200Z] [INFO] Creating new sandbox for session abc123
+   [2024-01-15T10:00:32.500Z] [INFO] Sandbox created sandbox-xyz in 2300ms
    ```
 
 ### Bash command test
@@ -184,6 +191,18 @@ Delete the OpenCode session from the session list. The plugin handles the `sessi
 ---
 
 ## Troubleshooting
+
+### No sandbox starts when I launch OpenCode
+
+This is expected. The plugin does **not** create a sandbox at launch — a sandbox is provisioned lazily on the first intercepted tool call (bash, read, write, edit, ls, glob, grep) in a session. Until the model runs a tool, there is no sandbox and no "Sandbox created" toast.
+
+To start one, ask the model to run a command (e.g. `Run: uname -a`). If you've made a tool call and still see no sandbox, check `~/.local/share/opencode/log/tensorlake.log`:
+
+- **File is missing entirely** → the plugin never loaded. See [Plugin not loading](#plugin-not-loading).
+- **File exists but logs an auth error (401/403)** → verify `TENSORLAKE_API_KEY` is exported in the same environment OpenCode runs in (`echo $TENSORLAKE_API_KEY`). For PAT keys, also set `TENSORLAKE_ORGANIZATION_ID` and `TENSORLAKE_PROJECT_ID`.
+- **File exists and logs `Creating new sandbox` but it hangs or errors** → the API call to create the sandbox failed; check the error message in the log.
+
+> Note: OpenCode installs the npm package into its own cache (`~/.cache/opencode/packages/`), not your project or global `node_modules`. You don't need to `npm install` the plugin yourself — listing it in `opencode.json` is enough. A manual `npm install` elsewhere has no effect on what OpenCode loads.
 
 ### Plugin not loading
 
