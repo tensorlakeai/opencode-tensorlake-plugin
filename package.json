@@ -9,6 +9,14 @@
     "plugin",
     "sandbox"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tensorlakeai/opencode-tensorlake-plugin.git"
+  },
+  "homepage": "https://docs.tensorlake.ai/sandboxes/opencode",
+  "bugs": {
+    "url": "https://github.com/tensorlakeai/opencode-tensorlake-plugin/issues"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "type": "module",
