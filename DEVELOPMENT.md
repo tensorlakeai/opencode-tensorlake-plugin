@@ -45,7 +45,10 @@ opencode-tensorlake-plugin/
             │   ├── client.ts                 # Tensorlake SDK client wrapper
             │   ├── credentials.ts            # API key resolution (auth.json + env)
             │   ├── logger.ts                 # file-based logger with rotation
+            │   ├── project-context.ts        # resolves the local project path and its sync identity
+            │   ├── project-sync.ts           # syncs the local project into the sandbox (git/mount/volume)
             │   ├── session-manager.ts        # sandbox lifecycle management
+            │   ├── shell.ts                  # local shell command helpers
             │   ├── toast.ts                  # TUI toast queue
             │   └── types.ts                  # shared type definitions
             ├── tools/

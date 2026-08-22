@@ -1,15 +1,15 @@
 import { z } from 'zod'
 import type { PluginInput } from '@opencode-ai/plugin'
 import type { ToolContext } from '@opencode-ai/plugin/tool'
-import type { TensorLakeSessionManager } from '../core/session-manager.js'
+import type { TensorlakeSessionManager } from '../core/session-manager.js'
 
 export const readTool = (
-  sessionManager: TensorLakeSessionManager,
+  sessionManager: TensorlakeSessionManager,
   projectId: string,
   worktree: string,
   pluginCtx: PluginInput,
 ) => ({
-  description: 'Reads a file from the TensorLake sandbox',
+  description: 'Reads a file from the Tensorlake sandbox',
   args: {
     filePath: z.string(),
   },

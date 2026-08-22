@@ -1,4 +1,5 @@
 import { RemoteAPIError, Sandbox, SandboxConnectionError, SandboxNotFoundError } from 'tensorlake'
+import type { FileSystemMount } from 'tensorlake'
 import { execFileSync } from 'child_process'
 import { PROJECT_KEY_PREFIX } from './credentials.js'
 import { logger } from './logger.js'
@@ -35,7 +36,15 @@ type HandleEntry = {
   sandbox?: Sandbox
 }
 
-export class TensorLakeClient {
+export type ProcessStatusInfo = {
+  pid: number
+  status: string
+  exitCode?: number
+  signal?: number
+  command: string
+}
+
+export class TensorlakeClient {
   // Connected handles keyed by sandboxId, so repeated operations reuse the
   // resolved proxy routing instead of re-resolving on every call. The pending
   // connect promise is cached (not the resolved handle) so concurrent calls
@@ -167,7 +176,7 @@ export class TensorLakeClient {
       })
   }
 
-  async createSandbox(opts: { image?: string; name?: string; timeoutSecs?: number } = {}): Promise<CreateSandboxResponse> {
+  async createSandbox(opts: { image?: string; name?: string; timeoutSecs?: number; fileSystems?: FileSystemMount[] } = {}): Promise<CreateSandboxResponse> {
     const cpus = parseFloat(process.env.TENSORLAKE_CPUS ?? '2')
     const memoryMb = parseInt(process.env.TENSORLAKE_MEMORY_MB ?? '4096', 10)
     const ephemeralDiskMb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
@@ -181,10 +190,21 @@ export class TensorLakeClient {
       diskMb: ephemeralDiskMb,
       ...(opts.name ? { name: opts.name } : {}),
       ...(opts.timeoutSecs ? { timeoutSecs: opts.timeoutSecs } : {}),
+      ...(opts.fileSystems?.length ? { fileSystems: opts.fileSystems } : {}),
       ...this.clientOptions(),
     })
     this.handles.set(sandbox.sandboxId, { apiKey: this.getApiKey(), promise: Promise.resolve(sandbox), sandbox })
     return { sandbox_id: sandbox.sandboxId, status: 'running' }
+  }
+
+  async listSandboxFileSystems(sandboxId: string): Promise<FileSystemMount[]> {
+    const info = await this.withSandbox(sandboxId, (sandbox) => sandbox.info())
+    return info.fileSystems ?? []
+  }
+
+  async attachFileSystem(sandboxId: string, fileSystemId: string, mountPath: string): Promise<void> {
+    // retry: false — a retried attach after a mid-flight failure could double-attach
+    await this.withSandbox(sandboxId, (sandbox) => sandbox.attachFileSystem(fileSystemId, mountPath), { retry: false })
   }
 
   async getSandbox(sandboxId: string): Promise<SandboxInfo> {
@@ -260,7 +280,10 @@ export class TensorLakeClient {
     while (Date.now() < deadline) {
       const info = await this.getSandbox(sandboxId)
       if (info.status === 'running') return
-      if (info.status === 'terminated') throw new Error(`Sandbox ${sandboxId} was terminated`)
+      // 'timeout' is terminal like 'terminated' — fail fast instead of polling to the deadline
+      if (info.status === 'terminated' || info.status === 'timeout') {
+        throw new Error(`Sandbox ${sandboxId} is ${info.status}`)
+      }
       await new Promise((r) => setTimeout(r, 500))
     }
     throw new Error(`Sandbox ${sandboxId} did not become running within ${timeoutMs}ms`)
@@ -287,6 +310,41 @@ export class TensorLakeClient {
       stdout: result.stdout ?? '',
       stderr: result.stderr ?? '',
     }
+  }
+
+  // Processes are started unnamed (non-managed) on purpose: the daemon keeps
+  // tracking them after exit or kill, so status and output stay queryable by PID.
+  async startBackgroundProcess(sandboxId: string, command: string, workingDir: string): Promise<number> {
+    const info = await this.withSandbox(
+      sandboxId,
+      (sandbox) =>
+        sandbox.startProcess('sh', {
+          args: ['-c', command],
+          workingDir,
+        }),
+      { retry: false },
+    )
+    return info.pid
+  }
+
+  async getProcessStatus(sandboxId: string, pid: number): Promise<ProcessStatusInfo> {
+    const info = await this.withSandbox(sandboxId, (sandbox) => sandbox.getProcess(pid))
+    return {
+      pid: info.pid,
+      status: info.status as unknown as string,
+      exitCode: info.exitCode,
+      signal: info.signal,
+      command: [info.command, ...(info.args ?? [])].join(' '),
+    }
+  }
+
+  async getProcessOutput(sandboxId: string, pid: number): Promise<string[]> {
+    const output = await this.withSandbox(sandboxId, (sandbox) => sandbox.getOutput(pid))
+    return output.lines
+  }
+
+  async killProcess(sandboxId: string, pid: number): Promise<void> {
+    await this.withSandbox(sandboxId, (sandbox) => sandbox.killProcess(pid))
   }
 
   async readFile(sandboxId: string, path: string): Promise<Buffer> {

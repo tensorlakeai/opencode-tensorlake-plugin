@@ -1,15 +1,15 @@
 import { z } from 'zod'
 import type { PluginInput } from '@opencode-ai/plugin'
 import type { ToolContext } from '@opencode-ai/plugin/tool'
-import type { TensorLakeSessionManager } from '../core/session-manager.js'
+import type { TensorlakeSessionManager } from '../core/session-manager.js'
 
 export const editTool = (
-  sessionManager: TensorLakeSessionManager,
+  sessionManager: TensorlakeSessionManager,
   projectId: string,
   worktree: string,
   pluginCtx: PluginInput,
 ) => ({
-  description: 'Replaces a string in a file in the TensorLake sandbox',
+  description: 'Replaces a string in a file in the Tensorlake sandbox',
   args: {
     filePath: z.string(),
     oldString: z.string(),
