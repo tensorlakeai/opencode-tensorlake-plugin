@@ -3,5 +3,9 @@
   "compilerOptions": {
     "outDir": "./dist",
     "rootDir": "./.opencode/plugin"
+    // module/moduleResolution stay NodeNext from tsconfig.json so the build
+    // resolves exactly like `npm run type-check`. Emit is ESM either way:
+    // the nearest package.json (.opencode/package.json locally, the root one
+    // on a fresh clone — .opencode's is untracked) declares "type": "module".
   }
 }

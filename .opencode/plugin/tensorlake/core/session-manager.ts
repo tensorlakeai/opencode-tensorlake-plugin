@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
+import { RemoteAPIError } from 'tensorlake'
 import { TensorLakeClient } from './client.js'
+import { LOGIN_HINT, projectKeyWarning } from './credentials.js'
 import { logger } from './logger.js'
 import { toast } from './toast.js'
 import type { ProjectSessionData } from './types.js'
@@ -12,11 +14,13 @@ export class TensorLakeSessionManager {
   private readonly cache = new Map<string, { sandboxId: string }>()
   // In-flight getSandbox promises keyed by sessionId — prevents concurrent double-resume
   private readonly inflight = new Map<string, Promise<{ sandboxId: string }>>()
+  // Keys already checked for project scope — the warning fires once per key
+  private readonly warnedKeys = new Set<string>()
   public readonly workDir: string
   private readonly storageDir: string
 
-  constructor(apiKey: string, storageDir: string, workDir: string) {
-    this.client = new TensorLakeClient(apiKey)
+  constructor(resolveKey: () => string | undefined, storageDir: string, workDir: string) {
+    this.client = new TensorLakeClient(resolveKey)
     this.storageDir = storageDir
     this.workDir = workDir
   }
@@ -79,9 +83,24 @@ export class TensorLakeSessionManager {
     const existing = this.inflight.get(sessionId)
     if (existing) return existing
     const promise = this._getSandbox(sessionId, projectId, worktree, pluginCtx)
+      .catch((err: unknown) => {
+        throw this.asLoginError(err)
+      })
       .finally(() => this.inflight.delete(sessionId))
     this.inflight.set(sessionId, promise)
     return promise
+  }
+
+  // Login cannot validate the key (OpenCode masks it away from the plugin),
+  // so a wrong or revoked key first surfaces here as a 401/403 from the
+  // management API. Turn it into the log-in-again toast the README promises
+  // instead of leaking a raw SDK error.
+  private asLoginError(err: unknown): unknown {
+    if (!(err instanceof RemoteAPIError) || ![401, 403].includes(err.statusCode)) return err
+    const msg = `Tensorlake rejected the API key (HTTP ${err.statusCode}). ${LOGIN_HINT}`
+    logger.error(msg)
+    toast.show({ title: 'Tensorlake login required', message: msg, variant: 'error' })
+    return new Error(msg)
   }
 
   private async _getSandbox(
@@ -93,9 +112,22 @@ export class TensorLakeSessionManager {
     if (pluginCtx?.client?.tui) toast.initialize(pluginCtx.client.tui)
 
     if (!this.client.hasApiKey()) {
-      const msg = 'TENSORLAKE_API_KEY is not set. Please set the environment variable.'
-      toast.show({ title: 'Sandbox error', message: msg, variant: 'error' })
+      const msg = `No Tensorlake credentials found. ${LOGIN_HINT}`
+      logger.error(`Tool call blocked for session ${sessionId}: ${msg}`)
+      toast.show({ title: 'Tensorlake login required', message: msg, variant: 'error' })
       throw new Error(msg)
+    }
+
+    // Login can no longer validate the key (OpenCode masks it away from the
+    // plugin), so warn once per key when it doesn't look project-scoped.
+    const apiKey = this.client.getApiKey()
+    if (!this.warnedKeys.has(apiKey)) {
+      this.warnedKeys.add(apiKey)
+      const warning = projectKeyWarning(apiKey)
+      if (warning) {
+        logger.warn(warning)
+        toast.show({ title: 'Check your Tensorlake API key', message: warning, variant: 'warning' })
+      }
     }
 
     // Check in-memory cache
