@@ -30,7 +30,7 @@ Override the automatic choice with `TENSORLAKE_SYNC_MODE`:
 export TENSORLAKE_SYNC_MODE=git     # always use git push/clone
 export TENSORLAKE_SYNC_MODE=mount   # require the folder to be a tl fs mount and attach it
 export TENSORLAKE_SYNC_MODE=volume  # always upload to a cloud volume
-export TENSORLAKE_SYNC_MODE=off     # disable project sync (pre-0.2.0 behavior)
+export TENSORLAKE_SYNC_MODE=off     # disable project sync (pre-0.3.0 behavior)
 ```
 
 Sync failures are surfaced as a toast and logged, but never block the sandbox — you just get an empty workspace.

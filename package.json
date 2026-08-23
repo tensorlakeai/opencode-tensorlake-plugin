@@ -1,6 +1,6 @@
 {
   "name": "tensorlake-opencode",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "Apache-2.0",
   "description": "OpenCode plugin that runs all sessions in Tensorlake sandboxes for isolated execution environments",
   "keywords": [
