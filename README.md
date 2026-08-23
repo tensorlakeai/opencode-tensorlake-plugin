@@ -1,59 +1,29 @@
 # tensorlake-opencode
 
-An OpenCode plugin that runs all AI sessions inside isolated [TensorLake](https://tensorlake.ai) sandboxes. Every bash command, file read/write, and search is executed in the sandbox rather than on your local machine.
+An OpenCode plugin that runs all AI sessions inside isolated [Tensorlake](https://tensorlake.ai) sandboxes. Every bash command, file read/write, and search executes in the sandbox, not on your local machine.
 
----
+## How it works
 
-## Overview
+The plugin intercepts OpenCode's standard tools (`bash`, `read`, `write`, `edit`, `ls`, `glob`, `grep`) and routes them to a Tensorlake sandbox at `/tmp/workspace`.
 
-When the plugin is active, OpenCode intercepts the standard tool calls (bash, read, write, edit, ls, glob, grep) and routes them to a TensorLake sandbox.
+- **Lazy creation** — no sandbox starts when you launch OpenCode. The sandbox is created on the model's first tool call in a session. To start one, ask the model to run a command.
+- **Lifecycle** — the sandbox is deleted when you delete the session. Sandbox state persists to disk, so sessions reconnect across OpenCode restarts. A suspended sandbox resumes automatically before use.
+- **Visibility** — sandbox events (created, connected, resumed, deleted) appear as TUI toasts, and all plugin activity is logged to `~/.local/share/opencode/log/tensorlake.log`.
 
-> **No sandbox is created when you start OpenCode.** The sandbox is provisioned lazily on the model's first tool call in a session. If you launch OpenCode and nothing seems to happen, that's expected — ask the model to run a command to spin one up.
+## Requirements
 
-- **Sandbox lifecycle** - A sandbox is created lazily on the **first intercepted tool call** in a session (not at launch) and deleted when the session is deleted. Sandbox state is persisted to disk so that reconnection is possible across OpenCode restarts.
-- **Suspension/resume** - If a sandbox is found in a suspended state it is automatically resumed before use.
-- **System prompt injection** - A block is appended to the system prompt on every request informing the model that it is operating inside a sandbox at `/tmp/workspace`.
-- **Toast notifications** - Sandbox status events (created, connected, resumed, deleted) surface as TUI toasts.
-- **Logging** - All plugin activity is written to `~/.local/share/opencode/log/tensorlake.log`.
+- An OpenCode installation ([opencode.ai](https://opencode.ai))
+- A Tensorlake **project API key** — sign up at [tensorlake.ai](https://tensorlake.ai), then create a key at [cloud.tensorlake.ai](https://cloud.tensorlake.ai) under your project → **API Keys**
 
-### Intercepted tools
+Supported platforms (the Tensorlake SDK ships a native binary):
 
-| OpenCode tool | Sandbox implementation |
-|---|---|
-| `bash` | `sandbox.run('sh', { args: ['-c', cmd] })` via SDK |
-| `read` | `sandbox.readFile(path)` via SDK |
-| `write` | `sandbox.writeFile(path, content)` via SDK |
-| `edit` | read + string replace + write |
-| `ls` | `sandbox.listDirectory(path)` via SDK |
-| `glob` | `find … -name "pattern"` via bash |
-| `grep` | `grep -rn …` via bash |
-
----
-
-## Prerequisites
-
-- An OpenCode installation (see [opencode.ai](https://opencode.ai))
-- A TensorLake account and a **project API key** (sign up at [tensorlake.ai](https://tensorlake.ai), then create a key at [cloud.tensorlake.ai](https://cloud.tensorlake.ai) under your project → API Keys)
-
-### Supported platforms
-
-The TensorLake SDK ships a native client binary for these platforms:
-
-- macOS: Apple Silicon only (`darwin-arm64`). Intel Macs (`x86_64`) are not supported.
+- macOS: Apple Silicon only (Intel Macs are not supported)
 - Linux: x64 and arm64 (glibc and musl)
 - Windows: x64
 
-On an unsupported platform, the first tool call fails with `Missing native binding for <platform>`.
+## Install
 
----
-
-## Installation & Configuration
-
-OpenCode can install plugins directly from npm. Use the npm package name in your OpenCode config unless you are developing the plugin locally.
-
-### 1. Install from npm
-
-Add the plugin package name to `~/.config/opencode/opencode.json` (create it if it doesn't exist):
+Add the plugin to `~/.config/opencode/opencode.json` (create the file if it does not exist):
 
 ```json
 {
@@ -64,292 +34,50 @@ Add the plugin package name to `~/.config/opencode/opencode.json` (create it if 
 }
 ```
 
-OpenCode treats bare plugin names as npm packages, so it will install `tensorlake-opencode` from the npm registry.
+OpenCode installs the package from npm automatically.
 
-You can list multiple plugins in the same array:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "tensorlake-opencode",
-    "opencode-helicone-session",
-    "opencode-wakatime",
-    "@my-org/custom-plugin"
-  ]
-}
-```
-
-### 2. Log in
-
-The plugin registers Tensorlake as a provider in OpenCode's standard auth flow. Run:
+## Log in
 
 ```bash
 opencode auth login
 ```
 
-Select **Tensorlake** from the provider list and paste a **project API key** (starts with `tl_apiKey_`). Create one at [cloud.tensorlake.ai](https://cloud.tensorlake.ai) — open your project → **API Keys**. Project keys carry their own organization/project scope, so nothing else is needed.
+Select **Tensorlake** and paste a project API key (starts with `tl_apiKey_`). The key is stored in OpenCode's credential store next to your other provider credentials. If the key is wrong, the first tool call shows an error toast that tells you to log in again.
 
-The key is stored in OpenCode's credential store (`~/.local/share/opencode/auth.json`) alongside your other provider credentials. It is checked on first use, not at login: if the key is wrong, the first tool call shows an error toast that tells you to log in again. No environment variables, no shell profile edits.
+**CI / automation:** set `TENSORLAKE_API_KEY` instead. The environment variable wins over the stored key. Personal Access Tokens work only through this path and also require `TENSORLAKE_ORGANIZATION_ID` and `TENSORLAKE_PROJECT_ID`; prefer project API keys.
 
-**CI / automation alternative:** set the `TENSORLAKE_API_KEY` environment variable instead. When both are present, the environment variable wins:
+## Configuration
 
-```bash
-export TENSORLAKE_API_KEY=tl_apiKey_...
-```
-
-Personal Access Tokens are supported only via the env-var path, and additionally require `TENSORLAKE_ORGANIZATION_ID` and `TENSORLAKE_PROJECT_ID`. Prefer project API keys.
-
-### Local development install
-
-OpenCode can also run plugins as TypeScript source files directly via its embedded Bun runtime. Use this option when you are modifying this repository locally.
-
-Clone the repository:
-
-```bash
-git clone https://github.com/tensorlakeai/opencode-tensorlake-plugin ~/opencode-tensorlake-plugin
-```
-
-Then point OpenCode at the plugin entry file:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "file:///Users/your-username/opencode-tensorlake-plugin/.opencode/plugin/index.ts"
-  ]
-}
-```
-
-For local paths:
-- The `file://` prefix is required. Without it, OpenCode treats the value as an npm package name.
-- The path must point directly to the `.ts` entry file (`.opencode/plugin/index.ts`), not the repository root.
-
-### Environment variables
+All settings are optional environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `TENSORLAKE_API_KEY` | (optional) | Overrides the key stored by `opencode auth login`. Use for CI/automation; interactive users should prefer `opencode auth login`. |
-| `TENSORLAKE_ORGANIZATION_ID` | (required for PAT keys) | Organization ID (e.g. `org_…`). Only needed when `TENSORLAKE_API_KEY` is a Personal Access Token; never needed for project API keys — a project key carries its own scope, which wins over these variables (a mismatch is logged as a warning). |
-| `TENSORLAKE_PROJECT_ID` | (required for PAT keys) | Project ID (e.g. `project_…`). Only needed when `TENSORLAKE_API_KEY` is a Personal Access Token; never needed for project API keys. |
-| `TENSORLAKE_API_URL` | `https://api.tensorlake.ai` | Override the management API base URL |
-| `TENSORLAKE_IMAGE` | (server default) | Container image to use when creating a new sandbox. Leave unset to use the platform default. |
-| `TENSORLAKE_CPUS` | `2` | Number of vCPUs allocated to the sandbox |
-| `TENSORLAKE_MEMORY_MB` | `4096` | RAM allocated to the sandbox in MB |
-| `TENSORLAKE_DISK_MB` | `10240` | Ephemeral disk size allocated to the sandbox in MB |
-| `TENSORLAKE_SANDBOX_PROXY_URL` | (auto) | Override the sandbox proxy URL (useful for local development). When set, all sandboxes use this single URL instead of the `https://{id}.sandbox.tensorlake.ai` pattern |
-
----
-
-## How to Test
-
-### Auth flow test
-
-1. Make sure `TENSORLAKE_API_KEY` is **not** exported and no Tensorlake entry exists in `~/.local/share/opencode/auth.json`.
-2. Start OpenCode and ask the model to run a command. The tool call should fail with a **"Tensorlake login required"** toast telling you to run `opencode auth login`.
-3. Run `opencode auth login` and select **Tensorlake**. A hint shows where to get a key (press Enter to continue), then paste a project API key at the masked **Enter your API key** prompt. The prompt does not validate the key; a non-project key triggers a **"Check your Tensorlake API key"** warning toast on the first tool call.
-4. Retry the tool call in the same OpenCode session — no restart needed. The sandbox should now be created.
-
-### Basic smoke test
-
-1. Log in once (`opencode auth login` → Tensorlake → paste a project API key), then start OpenCode in a project directory:
-
-   ```bash
-   opencode
-   ```
-
-2. After OpenCode loads, the plugin is active but **no sandbox exists yet** — sandboxes are created on the first intercepted tool call, not at startup. Confirm the plugin loaded by tailing its log:
-
-   ```bash
-   tail -f ~/.local/share/opencode/log/tensorlake.log
-   ```
-
-   On startup you should see a single line:
-
-   ```
-   [2024-01-15T10:00:01.000Z] [INFO] OpenCode started with TensorLake plugin
-   ```
-
-   If this file doesn't exist after launch, the plugin never loaded — see [Plugin not loading](#plugin-not-loading).
-
-3. Trigger sandbox creation by asking the model to run something (see the bash test below). The first tool call provisions the sandbox; you'll then see a toast — **"Sandbox created - New sandbox is ready."** — and new log lines:
-
-   ```
-   [2024-01-15T10:00:30.200Z] [INFO] Creating new sandbox for session abc123
-   [2024-01-15T10:00:32.500Z] [INFO] Sandbox created sandbox-xyz in 2300ms
-   ```
-
-### Bash command test
-
-In the OpenCode chat prompt, type:
-
-```
-Run: echo "hello from sandbox" && uname -a
-```
-
-The model will call the `bash` tool. Because the plugin intercepts it, the command executes inside the TensorLake sandbox. You should see Linux kernel information from the sandbox VM rather than your local machine.
-
-### File read/write test
-
-```
-Write the text "Hello TensorLake" to /tmp/workspace/test.txt, then read it back.
-```
-
-The model will:
-1. Call `write` with `filePath=/tmp/workspace/test.txt` → routed to `sandbox.writeFile()` via SDK
-2. Call `read` with `filePath=/tmp/workspace/test.txt` → routed to `sandbox.readFile()` via SDK
-
-The response should echo back `Hello TensorLake`.
-
-### Directory listing test
-
-```
-List the files in /tmp/workspace
-```
-
-This triggers the `ls` tool, which calls `sandbox.listDirectory('/tmp/workspace')` via the SDK.
-
-### Verifying sandbox deletion
-
-Delete the OpenCode session from the session list. The plugin handles the `session.deleted` event and calls `sdk.delete(sandboxId)` via the TensorLake SDK. Confirm in the log:
-
-```
-[…] [INFO] Deleting sandbox sandbox-xyz for session abc123
-[…] [INFO] Sandbox sandbox-xyz deleted
-```
-
----
+| `TENSORLAKE_API_KEY` | — | Overrides the key stored by `opencode auth login`. For CI/automation. |
+| `TENSORLAKE_ORGANIZATION_ID` | — | Required only for Personal Access Tokens. A project key carries its own scope. |
+| `TENSORLAKE_PROJECT_ID` | — | Required only for Personal Access Tokens. |
+| `TENSORLAKE_IMAGE` | server default | Container image for new sandboxes. |
+| `TENSORLAKE_CPUS` | `2` | vCPUs per sandbox. |
+| `TENSORLAKE_MEMORY_MB` | `4096` | RAM in MB. |
+| `TENSORLAKE_DISK_MB` | `10240` | Ephemeral disk in MB. |
+| `TENSORLAKE_API_URL` | `https://api.tensorlake.ai` | Management API base URL. |
+| `TENSORLAKE_SANDBOX_PROXY_URL` | auto | Sandbox proxy URL override, for local development. |
 
 ## Troubleshooting
 
-### No sandbox starts when I launch OpenCode
+**No sandbox starts when I launch OpenCode.** This is expected — the sandbox is created on the first tool call, not at launch. Ask the model to run a command (for example, `Run: uname -a`).
 
-This is expected. The plugin does **not** create a sandbox at launch — a sandbox is provisioned lazily on the first intercepted tool call (bash, read, write, edit, ls, glob, grep) in a session. Until the model runs a tool, there is no sandbox and no "Sandbox created" toast.
+**"Tensorlake login required" toast.** Run `opencode auth login`, select Tensorlake, and paste a project API key. No restart is needed — retry the tool call.
 
-To start one, ask the model to run a command (e.g. `Run: uname -a`). If you've made a tool call and still see no sandbox, check `~/.local/share/opencode/log/tensorlake.log`:
+**Auth error (401/403) in the log.** The stored key was revoked. Re-run `opencode auth login` with a fresh project API key.
 
-- **File is missing entirely** → the plugin never loaded. See [Plugin not loading](#plugin-not-loading).
-- **"Tensorlake login required" toast / `No Tensorlake credentials found` in the log** → run `opencode auth login`, select Tensorlake, and paste a project API key. No restart is needed — the plugin picks up the new credential within seconds; just retry the tool call. If you intended to use an env var instead, verify it's exported in the same environment OpenCode runs in (`echo $TENSORLAKE_API_KEY`).
-- **File exists but logs an auth error (401/403)** → the stored key was deleted or revoked. Re-run `opencode auth login` with a fresh project API key. For env-var PAT keys, also set `TENSORLAKE_ORGANIZATION_ID` and `TENSORLAKE_PROJECT_ID`.
-- **File exists and logs `Creating new sandbox` but it hangs or errors** → the API call to create the sandbox failed; check the error message in the log.
+**`Missing native binding for <platform>`.** Your platform is not supported by the Tensorlake SDK — see [Requirements](#requirements).
 
-> Note: OpenCode installs the npm package into its own cache (`~/.cache/opencode/packages/`), not your project or global `node_modules`. You don't need to `npm install` the plugin yourself — listing it in `opencode.json` is enough. A manual `npm install` elsewhere has no effect on what OpenCode loads.
+**Anything else.** Check `~/.local/share/opencode/log/tensorlake.log`. If the file does not exist, the plugin never loaded — see [DEVELOPMENT.md](DEVELOPMENT.md#debugging).
 
-### Plugin not loading
+## Contributing
 
-Check the OpenCode server log for errors:
+See [DEVELOPMENT.md](DEVELOPMENT.md) for local setup, project structure, manual tests, and debugging.
 
-```bash
-ls -lt ~/.local/share/opencode/log/*.log | head -3
-cat ~/.local/share/opencode/log/<latest>.log | grep -i "plugin\|error\|tensorlake"
-```
+## License
 
-**"Plugin export is not a function"** — The path in `opencode.json` points to the repository root instead of the `.ts` entry file. Make sure the path ends with `.opencode/plugin/index.ts`.
-
-**"404 failed to install plugin"** — For npm installs, verify the package name is `tensorlake-opencode`. For local development installs, this usually means the `file://` prefix is missing and OpenCode is trying to fetch your local path as an npm package name. Add `file://` before the absolute path.
-
-### Sandbox not being used
-
-If OpenCode loads but commands run locally (not in the sandbox), the plugin tools are not being registered. Verify by checking the server log for a second round of tool registrations after the built-ins:
-
-```
-service=tool.registry status=started bash   ← built-in
-...
-service=tool.registry status=started bash   ← plugin override (should appear)
-```
-
-If the second block is absent, the plugin loaded but failed to return its hooks. Check `tensorlake.log` for errors logged during startup.
-
-### Sandbox not suspending on exit
-
-Suspension requires the sandbox to have been **named** at creation time. Sandboxes created before this was implemented (ephemeral) cannot be suspended. Delete the old session from OpenCode's session list to trigger cleanup, then create a new session — new sandboxes are always named.
-
----
-
-## Development
-
-### Project structure
-
-```
-opencode-tensorlake-plugin/
-├── package.json
-├── tsconfig.json          # type-check config (no emit)
-├── tsconfig.lib.json      # build config (emits to dist/)
-└── .opencode/
-    └── plugin/
-        ├── index.ts                          # re-exports default plugin
-        └── tensorlake/
-            ├── index.ts                      # plugin factory
-            ├── tools.ts                      # assembles all tools
-            ├── core/
-            │   ├── client.ts                 # TensorLake SDK client (SandboxClient wrapper)
-            │   ├── logger.ts                 # file-based logger with rotation
-            │   ├── session-manager.ts        # sandbox lifecycle management
-            │   ├── toast.ts                  # TUI toast queue
-            │   └── types.ts                  # shared type definitions
-            ├── tools/
-            │   ├── bash.ts
-            │   ├── read.ts
-            │   ├── write.ts
-            │   ├── edit.ts
-            │   ├── ls.ts
-            │   ├── glob.ts
-            │   └── grep.ts
-            └── plugins/
-                ├── custom-tools.ts           # wires tools into plugin return value
-                ├── session-events.ts         # handles session.deleted event
-                └── system-transform.ts       # injects sandbox context into system prompt
-```
-
-### Type checking
-
-```bash
-npm run type-check
-```
-
-### Building
-
-```bash
-npm run build
-```
-
-Output is emitted to `dist/` with declaration files. The `tsconfig.lib.json` sets `rootDir` to `.opencode/plugin` so the output mirrors that structure under `dist/`. The `main` field in `package.json` points to `dist/index.js`.
-
-### Modifying sandbox resources
-
-To change the default CPU/memory/disk allocation, set environment variables before starting OpenCode:
-
-```bash
-export TENSORLAKE_CPUS=4
-export TENSORLAKE_MEMORY_MB=8192
-export TENSORLAKE_DISK_MB=20480
-```
-
-Or edit the defaults directly in `TensorLakeClient.createSandbox` inside `.opencode/plugin/tensorlake/core/client.ts`:
-
-```typescript
-const cpus = parseFloat(process.env.TENSORLAKE_CPUS ?? '2')
-const memoryMb = parseInt(process.env.TENSORLAKE_MEMORY_MB ?? '4096', 10)
-const ephemeralDiskMb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
-```
-
-### Changing the default sandbox image
-
-Set `TENSORLAKE_IMAGE` to a registered image name before starting OpenCode:
-
-```bash
-export TENSORLAKE_IMAGE=my-custom-image
-```
-
-When unset, the platform's default image is used. To register a custom image:
-
-```bash
-tl sbx image create Dockerfile --registered-name my-custom-image
-```
-
-### Adding new tools
-
-1. Create a new file in `.opencode/plugin/tensorlake/tools/mytool.ts` following the same pattern as the existing tools.
-2. Import and register it in `.opencode/plugin/tensorlake/tools.ts`.
-
-Each tool factory receives `(sessionManager, projectId, worktree, pluginCtx)` and returns an object with `description`, `args` (a Zod schema map), and `execute(args, ctx)`.
+Apache-2.0
