@@ -33,7 +33,17 @@ When the plugin is active, OpenCode intercepts the standard tool calls (bash, re
 ## Prerequisites
 
 - An OpenCode installation (see [opencode.ai](https://opencode.ai))
-- A TensorLake account and API key (sign up at [tensorlake.ai](https://tensorlake.ai))
+- A TensorLake account and a **project API key** (sign up at [tensorlake.ai](https://tensorlake.ai), then create a key at [cloud.tensorlake.ai](https://cloud.tensorlake.ai) under your project → API Keys)
+
+### Supported platforms
+
+The TensorLake SDK ships a native client binary for these platforms:
+
+- macOS: Apple Silicon only (`darwin-arm64`). Intel Macs (`x86_64`) are not supported.
+- Linux: x64 and arm64 (glibc and musl)
+- Windows: x64
+
+On an unsupported platform, the first tool call fails with `Missing native binding for <platform>`.
 
 ---
 
@@ -70,11 +80,25 @@ You can list multiple plugins in the same array:
 }
 ```
 
-### 2. Set your API key
+### 2. Log in
+
+The plugin registers Tensorlake as a provider in OpenCode's standard auth flow. Run:
 
 ```bash
-export TENSORLAKE_API_KEY=your_api_key_here
+opencode auth login
 ```
+
+Select **Tensorlake** from the provider list and paste a **project API key** (starts with `tl_apiKey_`). Create one at [cloud.tensorlake.ai](https://cloud.tensorlake.ai) — open your project → **API Keys**. Project keys carry their own organization/project scope, so nothing else is needed.
+
+The key is stored in OpenCode's credential store (`~/.local/share/opencode/auth.json`) alongside your other provider credentials. It is checked on first use, not at login: if the key is wrong, the first tool call shows an error toast that tells you to log in again. No environment variables, no shell profile edits.
+
+**CI / automation alternative:** set the `TENSORLAKE_API_KEY` environment variable instead. When both are present, the environment variable wins:
+
+```bash
+export TENSORLAKE_API_KEY=tl_apiKey_...
+```
+
+Personal Access Tokens are supported only via the env-var path, and additionally require `TENSORLAKE_ORGANIZATION_ID` and `TENSORLAKE_PROJECT_ID`. Prefer project API keys.
 
 ### Local development install
 
@@ -105,9 +129,9 @@ For local paths:
 
 | Variable | Default | Description |
 |---|---|---|
-| `TENSORLAKE_API_KEY` | (required) | Your TensorLake API key |
-| `TENSORLAKE_ORGANIZATION_ID` | (required for PAT keys) | Organization ID (e.g. `org_…`). Required when using a Personal Access Token; not needed for project-scoped keys. |
-| `TENSORLAKE_PROJECT_ID` | (required for PAT keys) | Project ID (e.g. `project_…`). Required when using a Personal Access Token; not needed for project-scoped keys. |
+| `TENSORLAKE_API_KEY` | (optional) | Overrides the key stored by `opencode auth login`. Use for CI/automation; interactive users should prefer `opencode auth login`. |
+| `TENSORLAKE_ORGANIZATION_ID` | (required for PAT keys) | Organization ID (e.g. `org_…`). Only needed when `TENSORLAKE_API_KEY` is a Personal Access Token; never needed for project API keys — a project key carries its own scope, which wins over these variables (a mismatch is logged as a warning). |
+| `TENSORLAKE_PROJECT_ID` | (required for PAT keys) | Project ID (e.g. `project_…`). Only needed when `TENSORLAKE_API_KEY` is a Personal Access Token; never needed for project API keys. |
 | `TENSORLAKE_API_URL` | `https://api.tensorlake.ai` | Override the management API base URL |
 | `TENSORLAKE_IMAGE` | (server default) | Container image to use when creating a new sandbox. Leave unset to use the platform default. |
 | `TENSORLAKE_CPUS` | `2` | Number of vCPUs allocated to the sandbox |
@@ -119,12 +143,18 @@ For local paths:
 
 ## How to Test
 
+### Auth flow test
+
+1. Make sure `TENSORLAKE_API_KEY` is **not** exported and no Tensorlake entry exists in `~/.local/share/opencode/auth.json`.
+2. Start OpenCode and ask the model to run a command. The tool call should fail with a **"Tensorlake login required"** toast telling you to run `opencode auth login`.
+3. Run `opencode auth login` and select **Tensorlake**. A hint shows where to get a key (press Enter to continue), then paste a project API key at the masked **Enter your API key** prompt. The prompt does not validate the key; a non-project key triggers a **"Check your Tensorlake API key"** warning toast on the first tool call.
+4. Retry the tool call in the same OpenCode session — no restart needed. The sandbox should now be created.
+
 ### Basic smoke test
 
-1. Set the environment variable and start OpenCode in a project directory:
+1. Log in once (`opencode auth login` → Tensorlake → paste a project API key), then start OpenCode in a project directory:
 
    ```bash
-   export TENSORLAKE_API_KEY=your_key
    opencode
    ```
 
@@ -199,7 +229,8 @@ This is expected. The plugin does **not** create a sandbox at launch — a sandb
 To start one, ask the model to run a command (e.g. `Run: uname -a`). If you've made a tool call and still see no sandbox, check `~/.local/share/opencode/log/tensorlake.log`:
 
 - **File is missing entirely** → the plugin never loaded. See [Plugin not loading](#plugin-not-loading).
-- **File exists but logs an auth error (401/403)** → verify `TENSORLAKE_API_KEY` is exported in the same environment OpenCode runs in (`echo $TENSORLAKE_API_KEY`). For PAT keys, also set `TENSORLAKE_ORGANIZATION_ID` and `TENSORLAKE_PROJECT_ID`.
+- **"Tensorlake login required" toast / `No Tensorlake credentials found` in the log** → run `opencode auth login`, select Tensorlake, and paste a project API key. No restart is needed — the plugin picks up the new credential within seconds; just retry the tool call. If you intended to use an env var instead, verify it's exported in the same environment OpenCode runs in (`echo $TENSORLAKE_API_KEY`).
+- **File exists but logs an auth error (401/403)** → the stored key was deleted or revoked. Re-run `opencode auth login` with a fresh project API key. For env-var PAT keys, also set `TENSORLAKE_ORGANIZATION_ID` and `TENSORLAKE_PROJECT_ID`.
 - **File exists and logs `Creating new sandbox` but it hangs or errors** → the API call to create the sandbox failed; check the error message in the log.
 
 > Note: OpenCode installs the npm package into its own cache (`~/.cache/opencode/packages/`), not your project or global `node_modules`. You don't need to `npm install` the plugin yourself — listing it in `opencode.json` is enough. A manual `npm install` elsewhere has no effect on what OpenCode loads.
