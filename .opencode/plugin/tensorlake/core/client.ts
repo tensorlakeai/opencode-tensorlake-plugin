@@ -185,6 +185,12 @@ export class TensorlakeClient {
     await this.withSandbox(sandboxId, (sandbox) => sandbox.attachFileSystem(fileSystemId, mountPath), { retry: false })
   }
 
+  async detachFileSystem(sandboxId: string, mountPath: string): Promise<void> {
+    // retry: false — a retry after a mid-flight success would fail on the
+    // already-detached path and mask the real outcome
+    await this.withSandbox(sandboxId, (sandbox) => sandbox.detachFileSystem(mountPath), { retry: false })
+  }
+
   async getSandbox(sandboxId: string): Promise<SandboxInfo> {
     const info = await this.withSandbox(sandboxId, (sandbox) => sandbox.info())
     return { sandbox_id: info.sandboxId, status: info.status as unknown as string }

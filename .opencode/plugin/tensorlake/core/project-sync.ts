@@ -1,7 +1,7 @@
 import { createHash } from 'crypto'
-import { existsSync, readdirSync, lstatSync, statSync, unlinkSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
+import { existsSync, readdirSync, lstatSync, statSync, unlinkSync, readFileSync, writeFileSync, mkdirSync, chmodSync, realpathSync } from 'fs'
 import { homedir } from 'os'
-import { join, basename, dirname } from 'path'
+import { join, basename, dirname, sep } from 'path'
 import { posix } from 'path'
 import { tmpdir } from 'os'
 import { execFile } from 'child_process'
@@ -401,6 +401,26 @@ async function buildUncommittedPatch(worktree: string): Promise<string | null> {
 }
 
 /**
+ * Content hash of the whole worktree for repos with no commits yet: stage
+ * everything into a temporary index and hash the resulting tree. There is no
+ * HEAD to diff against, so this is the fingerprint's only view of the files.
+ */
+async function worktreeTreeHash(worktree: string): Promise<string> {
+  const tmpIndex = join(tmpdir(), `tensorlake-sync-index-${process.pid}-${Date.now()}`)
+  const env = { GIT_INDEX_FILE: tmpIndex }
+  try {
+    await localGit(worktree, ['add', '-A'], env)
+    return (await localGit(worktree, ['write-tree'], env)).trim()
+  } finally {
+    try {
+      unlinkSync(tmpIndex)
+    } catch {
+      // temp index may not exist if an early git call failed
+    }
+  }
+}
+
+/**
  * Compact fingerprint of the local repo state that inbound sync replicates:
  * branch, HEAD, and a hash of the uncommitted patch. Two equal fingerprints
  * mean an inbound re-sync would be a no-op. Null when the state cannot be
@@ -417,8 +437,16 @@ export async function localGitFingerprint(worktree: string): Promise<string | nu
     }
     // An oversized patch returns null and so hashes like a clean tree: such
     // changes are not synced either way, and must not trigger re-sync churn.
-    const patch = head ? await buildUncommittedPatch(worktree) : null
-    const patchHash = patch ? createHash('sha1').update(patch).digest('hex') : ''
+    // With no HEAD there is no patch to build; hash the whole worktree
+    // instead, so edits in a not-yet-committed repo still change the
+    // fingerprint and re-trigger the snapshot sync.
+    let patchHash = ''
+    if (head) {
+      const patch = await buildUncommittedPatch(worktree)
+      if (patch) patchHash = createHash('sha1').update(patch).digest('hex')
+    } else {
+      patchHash = await worktreeTreeHash(worktree)
+    }
     return `${branch}\n${head}\n${patchHash}`
   } catch (err) {
     logger.warn(`Could not fingerprint local repo state: ${err}`)
@@ -530,7 +558,7 @@ export async function syncGitProject(
     const script = [
       'set -e',
       'git config --global credential.helper store',
-      `printf '%s\\n' '${credLine}' > ~/.git-credentials`,
+      credentialStoreScript(credLine),
       `git config --global user.name >/dev/null 2>&1 || git config --global user.name 'OpenCode Agent'`,
       `git config --global user.email >/dev/null 2>&1 || git config --global user.email 'opencode-agent@tensorlake.ai'`,
       `if [ -d '${destDir}/.git' ]; then`,
@@ -579,6 +607,20 @@ async function credentialLine(repos: RepositoryClient, repo: string): Promise<st
   return `${parsed.protocol}//${encodeURIComponent(cred.gitUsername)}:${encodeURIComponent(cred.token)}@${parsed.host}`
 }
 
+// Shell script that replaces only this host's line in the sandbox's
+// ~/.git-credentials, keeping credentials the agent added for other remotes.
+function credentialStoreScript(credLine: string): string {
+  const host = credLine.slice(credLine.lastIndexOf('@') + 1)
+  const hostPattern = host.replace(/[.[\]^$*\\]/g, '\\$&')
+  return [
+    'touch ~/.git-credentials',
+    `grep -v '@${hostPattern}$' ~/.git-credentials > ~/.git-credentials.tmp || true`,
+    `printf '%s\\n' '${credLine}' >> ~/.git-credentials.tmp`,
+    'chmod 600 ~/.git-credentials.tmp',
+    'mv ~/.git-credentials.tmp ~/.git-credentials',
+  ].join('\n')
+}
+
 // Git tokens live about one hour; re-mint the sandbox's stored credential
 // well before that so agent pushes keep working in long sessions.
 export const GIT_CREDENTIAL_REFRESH_MS = 30 * 60 * 1000
@@ -596,12 +638,7 @@ export async function refreshSandboxGitCredential(
   const repos = RepositoryClient.forCloud(cloudOptions(apiKey))
   try {
     const credLine = await credentialLine(repos, syncResourceName(projectId))
-    const result = await client.executeCommand(
-      sandboxId,
-      `printf '%s\\n' '${credLine}' > ~/.git-credentials`,
-      '/',
-      30_000,
-    )
+    const result = await client.executeCommand(sandboxId, credentialStoreScript(credLine), '/', 30_000)
     if (result.exitCode !== 0) {
       throw new Error(`writing ~/.git-credentials failed (exit ${result.exitCode}): ${result.stderr || result.stdout}`)
     }
@@ -923,6 +960,7 @@ export async function ensureVolumeWithProject(
       const tree = await walkVolumeTree(fs, version, manifest)
       manifest.files = tree.files
       manifest.dirs = tree.dirs
+      manifest.exec = tree.exec
       manifest.versionId = version
     }
   } catch (err) {
@@ -930,7 +968,11 @@ export async function ensureVolumeWithProject(
     logger.warn(`Could not record volume baseline for ${name}: ${err}`)
   }
 
-  manifest.paths = [...Object.keys(files), ...undeleted]
+  // Previously uploaded paths that still exist locally but were skipped this
+  // pass (oversized, unreadable, or now a symlink) stay tracked: if they are
+  // deleted later, their remote copy must still be removed.
+  const skippedButPresent = manifest.paths.filter((path) => present.has(path) && !(path in files))
+  manifest.paths = [...Object.keys(files), ...undeleted, ...skippedButPresent]
   writeVolumeManifest(manifestPath, manifest)
 
   return { fileSystemId: name, mountPath }
@@ -969,6 +1011,13 @@ export async function syncBackFromVolume(
   if (!head || head === manifest.versionId) return none
 
   const tree = await walkVolumeTree(fs, head, manifest)
+  let worktreeReal: string
+  try {
+    worktreeReal = realpathSync(worktree)
+  } catch (err) {
+    logger.warn(`Sync-back: cannot resolve worktree ${worktree}: ${err}`)
+    return none
+  }
   let downloaded = 0
   const conflicts: string[] = []
   for (const entry of tree.changed) {
@@ -980,7 +1029,12 @@ export async function syncBackFromVolume(
       logger.warn(`Sync-back: skipping ${entry.path} (${entry.size} bytes > ${MAX_FILE_BYTES})`)
       continue
     }
-    const localPath = join(worktree, entry.path)
+    const localPath = safeSyncBackDestination(worktree, worktreeReal, entry.path)
+    if (localPath === null) {
+      logger.warn(`Sync-back: refusing ${entry.path} — it resolves through a symlink to outside the worktree`)
+      conflicts.push(entry.path)
+      continue
+    }
     if (existsSync(localPath)) {
       const recorded = manifest.localHash[entry.path]
       let current: string
@@ -995,6 +1049,13 @@ export async function syncBackFromVolume(
         conflicts.push(entry.path)
         continue
       }
+    } else if (manifest.localHash[entry.path] !== undefined) {
+      // The file was synced before but the user has since deleted it locally.
+      // Recreating it would silently undo that deletion, so treat the local
+      // delete as the user's edit: keep it and report a conflict. Only files
+      // never seen locally are created as new.
+      conflicts.push(entry.path)
+      continue
     }
     const data = await fs.readFile(entry.path, head)
     if (data.byteLength > MAX_FILE_BYTES) {
@@ -1003,7 +1064,10 @@ export async function syncBackFromVolume(
     }
     mkdirSync(dirname(localPath), { recursive: true })
     writeFileSync(localPath, Buffer.from(data))
-    if (entry.executable) chmodSync(localPath, 0o755)
+    // Set or clear the exec bits while keeping the file's other permissions.
+    const mode = statSync(localPath).mode
+    const wanted = entry.executable ? mode | 0o111 : mode & ~0o111
+    if (wanted !== mode) chmodSync(localPath, wanted)
     manifest.localHash[entry.path] = createHash('sha1').update(Buffer.from(data)).digest('hex')
     downloaded++
   }
@@ -1021,30 +1085,44 @@ export async function syncBackFromVolume(
 
   manifest.files = tree.files
   manifest.dirs = tree.dirs
+  manifest.exec = tree.exec
   manifest.versionId = head
   writeVolumeManifest(manifestPath, manifest)
   return { downloaded, conflicts, deletedRemotely }
 }
 
-type VolumeTree = { files: Record<string, string>; dirs: Record<string, string>; changed: FileEntry[] }
+type VolumeTree = {
+  files: Record<string, string>
+  dirs: Record<string, string>
+  exec: Record<string, boolean>
+  changed: FileEntry[]
+}
 
 /**
  * List the volume's tree at one pinned version, skipping every directory
  * whose contentId matches the previous walk (its old entries are copied
  * forward), regenerable SKIP_DIRS, and symlinks. `changed` holds the file
- * entries whose contentId moved off the previous baseline.
+ * entries whose contentId or executable bit moved off the previous baseline —
+ * an exec-bit flip leaves the blob's contentId unchanged, so it needs its own
+ * comparison. `exec` records only the executable paths; absence means plain.
  */
 async function walkVolumeTree(
   fs: { listFiles(dirPath?: string, version?: string): Promise<FileEntry[]> },
   version: string,
-  prev: { files: Record<string, string>; dirs: Record<string, string> },
+  prev: { files: Record<string, string>; dirs: Record<string, string>; exec: Record<string, boolean> },
 ): Promise<VolumeTree> {
   const files: Record<string, string> = {}
   const dirs: Record<string, string> = {}
+  const exec: Record<string, boolean> = {}
   const changed: FileEntry[] = []
   const copyForward = (dirPath: string) => {
     const prefix = `${dirPath}/`
-    for (const [path, id] of Object.entries(prev.files)) if (path.startsWith(prefix)) files[path] = id
+    for (const [path, id] of Object.entries(prev.files)) {
+      if (path.startsWith(prefix)) {
+        files[path] = id
+        if (prev.exec[path]) exec[path] = true
+      }
+    }
     for (const [path, id] of Object.entries(prev.dirs)) if (path.startsWith(prefix)) dirs[path] = id
   }
   const stack = ['']
@@ -1060,11 +1138,14 @@ async function walkVolumeTree(
         else stack.push(entry.path)
       } else {
         files[entry.path] = entry.contentId
-        if (prev.files[entry.path] !== entry.contentId) changed.push(entry)
+        if (entry.executable) exec[entry.path] = true
+        if (prev.files[entry.path] !== entry.contentId || Boolean(prev.exec[entry.path]) !== entry.executable) {
+          changed.push(entry)
+        }
       }
     }
   }
-  return { files, dirs, changed }
+  return { files, dirs, exec, changed }
 }
 
 function sha1File(path: string): string {
@@ -1099,6 +1180,7 @@ type VolumeManifest = {
   versionId?: string
   files: Record<string, string>
   dirs: Record<string, string>
+  exec: Record<string, boolean>
   localHash: Record<string, string>
 }
 
@@ -1115,6 +1197,15 @@ function stringRecord(value: unknown): Record<string, string> {
   return out
 }
 
+function boolRecord(value: unknown): Record<string, boolean> {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) return {}
+  const out: Record<string, boolean> = {}
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (v === true) out[k] = true
+  }
+  return out
+}
+
 function readVolumeManifest(manifestPath: string): VolumeManifest {
   try {
     const parsed = JSON.parse(readFileSync(manifestPath, 'utf-8')) as Partial<VolumeManifest>
@@ -1124,10 +1215,11 @@ function readVolumeManifest(manifestPath: string): VolumeManifest {
       versionId: typeof parsed.versionId === 'string' ? parsed.versionId : undefined,
       files: stringRecord(parsed.files),
       dirs: stringRecord(parsed.dirs),
+      exec: boolRecord(parsed.exec),
       localHash: stringRecord(parsed.localHash),
     }
   } catch {
-    return { paths: [], files: {}, dirs: {}, localHash: {} }
+    return { paths: [], files: {}, dirs: {}, exec: {}, localHash: {} }
   }
 }
 
@@ -1138,6 +1230,42 @@ function writeVolumeManifest(manifestPath: string, manifest: VolumeManifest): vo
   } catch (err) {
     logger.warn(`Failed to write sync manifest ${manifestPath}: ${err}`)
   }
+}
+
+/**
+ * Resolve where a sync-back write of `relPath` really lands, and return that
+ * destination only when it stays inside the worktree. `isSafeRelativePath`
+ * validates the path string; this validates the filesystem: the destination
+ * itself must not be a symlink (a dangling one would redirect the write), and
+ * its nearest existing ancestor must not be, or resolve through, a symlink
+ * that leads outside the worktree. Returns null when the write must not
+ * happen.
+ */
+function safeSyncBackDestination(worktree: string, worktreeReal: string, relPath: string): string | null {
+  const localPath = join(worktree, relPath)
+  try {
+    if (lstatSync(localPath).isSymbolicLink()) return null
+  } catch {
+    // Nothing at the destination — fine, it is a new file.
+  }
+  let ancestor = dirname(localPath)
+  while (true) {
+    try {
+      if (lstatSync(ancestor).isSymbolicLink()) return null
+      break
+    } catch {
+      const parent = dirname(ancestor)
+      if (parent === ancestor) return null
+      ancestor = parent
+    }
+  }
+  try {
+    const real = realpathSync(ancestor)
+    if (real !== worktreeReal && !real.startsWith(worktreeReal + sep)) return null
+  } catch {
+    return null
+  }
+  return localPath
 }
 
 // Deletion paths are sent to the volume API verbatim, so accept only plain
@@ -1171,7 +1299,22 @@ export async function ensureVolumeMounted(
   sandboxId: string,
 ): Promise<void> {
   const mounts = await client.listSandboxFileSystems(sandboxId)
-  if (!mounts.some((m) => m.mountPath === mount.mountPath)) {
+  const existing = mounts.find((m) => m.mountPath === mount.mountPath)
+  if (existing && existing.fileSystemId !== mount.fileSystemId) {
+    // A different filesystem occupies the path (e.g. the project switched
+    // from a forced volume to a locally mounted filesystem). Detach it first
+    // — leaving it would run tools against stale storage while the plugin
+    // reports the requested filesystem as mounted.
+    logger.info(
+      `Detaching filesystem ${existing.fileSystemId} from sandbox ${sandboxId} at ${mount.mountPath} (expected ${mount.fileSystemId})`,
+    )
+    await client.detachFileSystem(sandboxId, mount.mountPath)
+    // The guest unmounts asynchronously; the readiness probe below cannot
+    // tell filesystems apart, so wait until the old mount is really gone
+    // before it can be mistaken for the new one.
+    await waitForGuestMount(client, sandboxId, mount.mountPath, { mounted: false })
+  }
+  if (!existing || existing.fileSystemId !== mount.fileSystemId) {
     // Attaching a filesystem the project does not have terminates the sandbox
     // — the guest dies instead of the attach call failing — so the name is
     // confirmed before it is ever sent to a live sandbox.
@@ -1191,9 +1334,9 @@ async function waitForGuestMount(
   client: TensorlakeClient,
   sandboxId: string,
   path: string,
-  timeoutMs = 30_000,
-  probeTimeoutMs = 5_000,
+  opts: { mounted?: boolean; timeoutMs?: number; probeTimeoutMs?: number } = {},
 ): Promise<void> {
+  const { mounted = true, timeoutMs = 30_000, probeTimeoutMs = 5_000 } = opts
   // `test -d` is not enough here: the sync-failure fallback mkdirs a plain
   // directory at this exact path, which would satisfy it while the volume is
   // not mounted at all. Require the path to be an actual mountpoint.
@@ -1202,12 +1345,14 @@ async function waitForGuestMount(
   for (;;) {
     try {
       const check = await client.executeCommand(sandboxId, probe, '/', probeTimeoutMs)
-      if (check.exitCode === 0) return
+      if ((check.exitCode === 0) === mounted) return
     } catch (err) {
       logger.warn(`Mount readiness check failed: ${err}`)
     }
     if (Date.now() >= deadline) {
-      throw new Error(`Volume mount at ${path} did not become visible in the sandbox within ${timeoutMs}ms`)
+      throw new Error(
+        `Volume mount at ${path} did not become ${mounted ? 'visible' : 'unmounted'} in the sandbox within ${timeoutMs}ms`,
+      )
     }
     await new Promise((resolve) => setTimeout(resolve, 500))
   }

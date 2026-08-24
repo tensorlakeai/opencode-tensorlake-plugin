@@ -218,11 +218,38 @@ export class TensorlakeSessionManager {
    * marker is written regardless) — the toast reports the failure and the
    * user fixes the command or runs it through the agent. Never throws.
    */
+  private setupMarkerPath(destDir: string, command: string): string {
+    const hash = createHash('sha1').update(`${destDir}\0${command}`).digest('hex').slice(0, 12)
+    return posix.join(this.workDir, `.tensorlake-setup-${hash}`)
+  }
+
+  /**
+   * Whether the setup command still has to run in this sandbox (no marker for
+   * the current command). Used to decide if a background refresh sync must be
+   * awaited instead: setup runs at the end of that sync, and the contract is
+   * that it completes before the first tool call. An unanswerable probe
+   * counts as pending — waiting is the safe side.
+   */
+  private async setupStillPending(sandboxId: string, destDir: string): Promise<boolean> {
+    const command = this.setupCommand
+    if (!command || this.setupChecked.has(sandboxId)) return false
+    const marker = this.setupMarkerPath(destDir, command)
+    try {
+      const probe = await this.client.executeCommand(sandboxId, `[ -f '${marker}' ]`, '/', 15_000)
+      if (probe.exitCode === 0) {
+        this.setupChecked.add(sandboxId)
+        return false
+      }
+      return true
+    } catch {
+      return true
+    }
+  }
+
   private async maybeRunSetup(sandboxId: string, destDir: string): Promise<void> {
     const command = this.setupCommand
     if (!command || this.setupChecked.has(sandboxId)) return
-    const hash = createHash('sha1').update(`${destDir}\0${command}`).digest('hex').slice(0, 12)
-    const marker = posix.join(this.workDir, `.tensorlake-setup-${hash}`)
+    const marker = this.setupMarkerPath(destDir, command)
     try {
       const probe = await this.client.executeCommand(sandboxId, `[ -f '${marker}' ]`, '/', 15_000)
       this.setupChecked.add(sandboxId)
@@ -330,11 +357,15 @@ export class TensorlakeSessionManager {
       this.synced.add(sandboxId)
       return
     }
+    const destDir = this.projectDir(worktree)
     if (this.hasProjectDir.has(sandboxId)) {
-      void this.syncProjectOnce(sandboxId, projectId, worktree)
+      const sync = this.syncProjectOnce(sandboxId, projectId, worktree)
+      // Setup runs at the end of the sync; it must finish before the first
+      // tool call, so only let the sync run in the background when the setup
+      // marker for the current command is already in place.
+      if (await this.setupStillPending(sandboxId, destDir)) await sync
       return
     }
-    const destDir = this.projectDir(worktree)
     try {
       // The check runs BEFORE the sync starts, so it can never observe a
       // half-populated clone. In git mode it requires a .git dir: only then
@@ -357,7 +388,10 @@ export class TensorlakeSessionManager {
       const check = await this.client.executeCommand(sandboxId, checkCmd, '/', 15_000)
       if (check.exitCode === 0) {
         this.hasProjectDir.add(sandboxId)
-        void this.syncProjectOnce(sandboxId, projectId, worktree)
+        const sync = this.syncProjectOnce(sandboxId, projectId, worktree)
+        // Same contract as above: a new or changed setup command must finish
+        // (it runs at the end of this sync) before the first tool call.
+        if (await this.setupStillPending(sandboxId, destDir)) await sync
         return
       }
     } catch (err) {
