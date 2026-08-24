@@ -4,7 +4,7 @@ An OpenCode plugin that runs all AI sessions inside isolated [Tensorlake](https:
 
 ## How it works
 
-The plugin intercepts OpenCode's standard tools (`bash`, `read`, `write`, `edit`, `ls`, `glob`, `grep`) and routes them to a Tensorlake sandbox at `/tmp/workspace`.
+The plugin intercepts OpenCode's standard tools (`bash`, `read`, `write`, `edit`, `apply_patch`, `ls`, `glob`, `grep`) and routes them to a Tensorlake sandbox at `/tmp/workspace`.
 
 - **Lazy creation** — no sandbox starts when you launch OpenCode. The sandbox is created on the model's first tool call in a session. To start one, ask the model to run a command.
 - **Lifecycle** — the sandbox is deleted when you delete the session. Sandbox state persists to disk, so sessions reconnect across OpenCode restarts. A suspended sandbox resumes automatically before use.
