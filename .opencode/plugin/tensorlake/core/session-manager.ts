@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { createHash } from 'crypto'
 import { join, posix } from 'path'
 import { RemoteAPIError } from 'tensorlake'
 import { TensorlakeClient } from './client.js'
@@ -9,15 +10,23 @@ import type { ProjectSessionData } from './types.js'
 import type { PluginInput } from '@opencode-ai/plugin'
 import {
   resolveSyncMode,
+  resolveSyncBranch,
   projectDirName,
   syncGitProject,
   syncBackFromSyncRepo,
+  syncBackFromVolume,
+  captureSandboxWip,
   ensureVolumeWithProject,
   ensureVolumeMounted,
   mountedFileSystemId,
+  localGitFingerprint,
   refreshSandboxGitCredential,
   GIT_CREDENTIAL_REFRESH_MS,
 } from './project-sync.js'
+import type { SyncBackReport, VolumeSyncBack } from './project-sync.js'
+
+/** What a (re-)sync attempt did, for the sync tool's report to the agent. */
+export type SyncOutcome = { ok: true; diverged: boolean } | { ok: false; error: string }
 
 export class TensorlakeSessionManager {
   private readonly client: TensorlakeClient
@@ -28,22 +37,36 @@ export class TensorlakeSessionManager {
   // Sandboxes whose project sync already ran in this process
   private readonly synced = new Set<string>()
   // In-flight sync promises keyed by sandboxId — prevents concurrent double-sync
-  private readonly syncInflight = new Map<string, Promise<void>>()
+  private readonly syncInflight = new Map<string, Promise<SyncOutcome>>()
   // Sandboxes confirmed to already contain the project dir (check runs once per process)
   private readonly hasProjectDir = new Set<string>()
   // Last failed sync attempt per sandbox — retried after a cooldown instead of on every tool call
   private readonly syncFailedAt = new Map<string, number>()
   private static readonly SYNC_RETRY_COOLDOWN_MS = 60_000
+  // Local git state (branch/HEAD/uncommitted hash) each sandbox last synced, keyed by sandboxId.
+  // A later tool call whose fingerprint differs triggers an automatic re-sync.
+  private readonly syncedFingerprint = new Map<string, string | null>()
+  // When the local-change fingerprint was last computed per sandbox — the check is throttled
+  private readonly resyncCheckedAt = new Map<string, number>()
+  private static readonly RESYNC_CHECK_INTERVAL_MS = 15_000
   // In-flight sync-back per worktree — session.idle can fire faster than a fetch completes
-  private readonly syncBackInflight = new Map<string, Promise<void>>()
+  private readonly syncBackInflight = new Map<string, Promise<SyncBackReport | VolumeSyncBack | undefined>>()
   // Last failed sync-back per worktree — retried after a cooldown instead of on every idle
   private readonly syncBackFailedAt = new Map<string, number>()
   // Sync repo commit already reported as "staged, not merged" per worktree — suppresses repeat toasts
   private readonly lastStagedOid = new Map<string, string>()
+  // Wip capture already reported per worktree+branch — suppresses repeat toasts
+  private readonly lastWipOid = new Map<string, string>()
   // Keys already checked for project scope — the warning fires once per key
   private readonly warnedKeys = new Set<string>()
   // When each sandbox's git credential was last written — tokens expire in ~1h
   private readonly credRefreshedAt = new Map<string, number>()
+  // Post-sync setup command (from plugin options / env); undefined = none
+  private setupCommand: string | undefined
+  // Sandboxes whose setup marker was already checked in this process — keeps
+  // re-syncs from paying a probe roundtrip every time
+  private readonly setupChecked = new Set<string>()
+  private static readonly SETUP_TIMEOUT_MS = 900_000
   public readonly workDir: string
   private readonly storageDir: string
 
@@ -55,6 +78,10 @@ export class TensorlakeSessionManager {
 
   getClient(): TensorlakeClient {
     return this.client
+  }
+
+  setSetupCommand(command: string | undefined): void {
+    this.setupCommand = command?.trim() || undefined
   }
 
   /** Directory inside the sandbox where the local project is synced. */
@@ -72,22 +99,38 @@ export class TensorlakeSessionManager {
    * mounted into the sandbox. Failures are logged and surfaced but never block
    * the sandbox.
    */
-  private async syncProject(sandboxId: string, projectId: string, worktree: string): Promise<void> {
-    if (this.synced.has(sandboxId)) return
+  private async syncProject(
+    sandboxId: string,
+    projectId: string,
+    worktree: string,
+    opts: { force?: boolean } = {},
+  ): Promise<SyncOutcome> {
+    if (!opts.force && this.synced.has(sandboxId)) return { ok: true, diverged: false }
     const mode = resolveSyncMode(worktree)
     if (mode === 'off') {
       this.synced.add(sandboxId)
-      return
+      return { ok: true, diverged: false }
     }
-    const failedAt = this.syncFailedAt.get(sandboxId)
-    if (failedAt !== undefined && Date.now() - failedAt < TensorlakeSessionManager.SYNC_RETRY_COOLDOWN_MS) return
+    if (!opts.force) {
+      const failedAt = this.syncFailedAt.get(sandboxId)
+      if (failedAt !== undefined && Date.now() - failedAt < TensorlakeSessionManager.SYNC_RETRY_COOLDOWN_MS) {
+        return { ok: false, error: 'a recent sync failed; the retry cooldown has not elapsed' }
+      }
+    }
     const destDir = this.projectDir(worktree)
     try {
+      let diverged = false
       if (mode === 'git') {
+        // Fingerprint before the push: edits made while the sync runs make the
+        // next check see a difference and sync again.
+        const fingerprint = await localGitFingerprint(worktree)
         toast.show({ title: 'Syncing project', message: `Pushing ${worktree} and cloning into the sandbox...`, variant: 'info' })
-        await syncGitProject(this.client, this.client.getApiKey(), sandboxId, worktree, projectId, destDir)
+        diverged =
+          (await syncGitProject(this.client, this.client.getApiKey(), sandboxId, worktree, projectId, destDir)) ===
+          'diverged'
         // The sync script wrote a fresh credential into the sandbox.
         this.credRefreshedAt.set(sandboxId, Date.now())
+        this.syncedFingerprint.set(sandboxId, fingerprint)
       } else if (mode === 'mount') {
         // The local folder already *is* the filesystem, so there is nothing to
         // copy: the sandbox mounts the same one, and the mount daemon's
@@ -97,20 +140,44 @@ export class TensorlakeSessionManager {
         toast.show({ title: 'Mounting project', message: `Mounting filesystem ${fileSystemId} into the sandbox...`, variant: 'info' })
         await ensureVolumeMounted(this.client, { fileSystemId, mountPath: destDir }, sandboxId)
       } else {
+        // Pull pending agent changes off the volume FIRST: the upload below
+        // records the volume's current content as the new sync-back baseline,
+        // so anything not downloaded now would never be downloaded later.
+        // Non-fatal — a failed pull must not block the sync.
+        try {
+          this.reportVolumeSyncBack(
+            worktree,
+            await syncBackFromVolume(this.client.getApiKey(), worktree, projectId, this.storageDir),
+          )
+        } catch (err: any) {
+          logger.warn(`Volume sync-back before upload failed: ${err?.message ?? err}`)
+        }
         toast.show({ title: 'Syncing project', message: `Uploading ${worktree} to a cloud volume...`, variant: 'info' })
         const mount = await ensureVolumeWithProject(this.client.getApiKey(), worktree, projectId, destDir, this.storageDir)
         await ensureVolumeMounted(this.client, mount, sandboxId)
       }
       this.synced.add(sandboxId)
       this.syncFailedAt.delete(sandboxId)
-      toast.show({
-        title: mode === 'mount' ? 'Project mounted' : 'Project synced',
-        message:
-          mode === 'mount'
-            ? `${destDir} and ${worktree} are the same filesystem; changes flow both ways.`
-            : `Project available at ${destDir}`,
-        variant: 'success',
-      })
+      // Runs before the sync outcome is reported, so on a fresh sandbox the
+      // first tool call waits until dependencies are installed.
+      await this.maybeRunSetup(sandboxId, destDir)
+      if (diverged) {
+        toast.show({
+          title: 'Project synced (sandbox diverged)',
+          message: `The sandbox clone at ${destDir} has its own commits or changes and was left as-is; the pushed state is on its 'origin' remote.`,
+          variant: 'warning',
+        })
+      } else {
+        toast.show({
+          title: mode === 'mount' ? 'Project mounted' : 'Project synced',
+          message:
+            mode === 'mount'
+              ? `${destDir} and ${worktree} are the same filesystem; changes flow both ways.`
+              : `Project available at ${destDir}`,
+          variant: 'success',
+        })
+      }
+      return { ok: true, diverged }
     } catch (err: any) {
       this.syncFailedAt.set(sandboxId, Date.now())
       logger.error(`Project sync (${mode}) failed: ${err?.stack ?? err}`)
@@ -122,17 +189,128 @@ export class TensorlakeSessionManager {
         logger.warn(`Failed to create project dir after sync failure: ${mkdirErr}`)
       }
       toast.show({ title: 'Project sync failed', message: `${err?.message ?? err}. Sandbox is usable but empty.`, variant: 'error' })
+      return { ok: false, error: `${err?.message ?? err}` }
     }
   }
 
   /** Run syncProject at most once concurrently per sandbox. Never rejects (syncProject handles its own errors). */
-  private syncProjectOnce(sandboxId: string, projectId: string, worktree: string): Promise<void> {
+  private syncProjectOnce(
+    sandboxId: string,
+    projectId: string,
+    worktree: string,
+    opts: { force?: boolean } = {},
+  ): Promise<SyncOutcome> {
     const existing = this.syncInflight.get(sandboxId)
     if (existing) return existing
-    const promise = this.syncProject(sandboxId, projectId, worktree)
+    const promise = this.syncProject(sandboxId, projectId, worktree, opts)
       .finally(() => this.syncInflight.delete(sandboxId))
     this.syncInflight.set(sandboxId, promise)
     return promise
+  }
+
+  /**
+   * Run the configured setup command (dependency install, seed data) after a
+   * successful sync — once per sandbox lifetime. Sandboxes are stateful, so
+   * "once" is tracked with a marker file inside the sandbox, not in process
+   * memory: an OpenCode restart reconnects to the same sandbox and must not
+   * pay for setup again. The marker name hashes the command and project dir,
+   * so changing the command re-runs it. A failed command is not retried (the
+   * marker is written regardless) — the toast reports the failure and the
+   * user fixes the command or runs it through the agent. Never throws.
+   */
+  private async maybeRunSetup(sandboxId: string, destDir: string): Promise<void> {
+    const command = this.setupCommand
+    if (!command || this.setupChecked.has(sandboxId)) return
+    const hash = createHash('sha1').update(`${destDir}\0${command}`).digest('hex').slice(0, 12)
+    const marker = posix.join(this.workDir, `.tensorlake-setup-${hash}`)
+    try {
+      const probe = await this.client.executeCommand(sandboxId, `[ -f '${marker}' ]`, '/', 15_000)
+      this.setupChecked.add(sandboxId)
+      if (probe.exitCode === 0) return
+      logger.info(`Running setup command in sandbox ${sandboxId}: ${command}`)
+      toast.show({ title: 'Running setup command', message: `${command} (in ${destDir})`, variant: 'info' })
+      const result = await this.client.executeCommand(
+        sandboxId,
+        command,
+        destDir,
+        TensorlakeSessionManager.SETUP_TIMEOUT_MS,
+      )
+      await this.client.executeCommand(sandboxId, `touch '${marker}'`, '/', 15_000)
+      if (result.exitCode === 0) {
+        logger.info(`Setup command finished in sandbox ${sandboxId}`)
+        toast.show({ title: 'Setup complete', message: `'${command}' finished in ${destDir}.`, variant: 'success' })
+      } else {
+        const tail = (result.stderr || result.stdout).trim().split('\n').slice(-3).join(' ').slice(0, 300)
+        logger.error(`Setup command failed in sandbox ${sandboxId} (exit ${result.exitCode}): ${tail}`)
+        toast.show({
+          title: 'Setup command failed',
+          message: `'${command}' exited ${result.exitCode} in ${destDir}. ${tail}`,
+          variant: 'error',
+        })
+      }
+    } catch (err: any) {
+      // Transient (sandbox hiccup, timeout): allow the next sync to try again.
+      this.setupChecked.delete(sandboxId)
+      logger.warn(`Setup command could not run in sandbox ${sandboxId}: ${err?.message ?? err}`)
+      toast.show({ title: 'Setup command failed', message: `${err?.message ?? err}`, variant: 'error' })
+    }
+  }
+
+  /**
+   * Fire-and-forget check for local changes since this sandbox's last sync
+   * (new commits, edits, a branch switch); a difference re-runs the inbound
+   * sync in the background. Throttled per sandbox, so tool calls stay cheap.
+   * Git mode only: mount mode is live already, and re-uploading a whole
+   * volume behind the user's back would clobber agent edits.
+   */
+  private maybeResyncIfLocalChanged(sandboxId: string, projectId: string, worktree: string): void {
+    if (resolveSyncMode(worktree) !== 'git') return
+    if (this.syncInflight.has(sandboxId)) return
+    const lastSynced = this.syncedFingerprint.get(sandboxId)
+    if (typeof lastSynced !== 'string') return
+    const checkedAt = this.resyncCheckedAt.get(sandboxId) ?? 0
+    if (Date.now() - checkedAt < TensorlakeSessionManager.RESYNC_CHECK_INTERVAL_MS) return
+    this.resyncCheckedAt.set(sandboxId, Date.now())
+    void (async () => {
+      const current = await localGitFingerprint(worktree)
+      if (!current || current === lastSynced) return
+      logger.info(`Local project changed since the last sync; re-syncing into sandbox ${sandboxId}`)
+      await this.syncProjectOnce(sandboxId, projectId, worktree, { force: true })
+    })().catch((err) => logger.warn(`Automatic re-sync failed: ${err}`))
+  }
+
+  /**
+   * Explicit re-sync for the `sync` tool: push the current local state into
+   * the sandbox now, then (in git mode) pull any agent commits back. Returns
+   * a message for the agent.
+   */
+  async syncNow(sessionId: string, projectId: string, worktree: string, pluginCtx?: PluginInput): Promise<string> {
+    const mode = resolveSyncMode(worktree)
+    if (mode === 'off') return 'Project sync is disabled (mode off); nothing to sync.'
+    const { sandboxId } = await this.getSandbox(sessionId, projectId, worktree, pluginCtx)
+    const destDir = this.projectDir(worktree)
+    if (mode === 'mount') {
+      return `The local folder and the sandbox share the same Tensorlake filesystem at ${destDir}; changes already flow both ways, no sync is needed.`
+    }
+    // getSandbox may have kicked off a background sync; let it finish, then
+    // force a fresh pass so state captured after it started is included too.
+    const inflight = this.syncInflight.get(sandboxId)
+    if (inflight) await inflight
+    const outcome = await this.syncProjectOnce(sandboxId, projectId, worktree, { force: true })
+    if (!outcome.ok) return `Project sync failed: ${outcome.error}`
+    if (mode === 'git') {
+      const report = await this.syncBack(sessionId, projectId, worktree)
+      const wipNote =
+        report && 'wip' in report && report.wip.length > 0
+          ? ` Uncommitted sandbox changes were staged on the user's local '${report.wip.map((w) => w.ref).join("', '")}' ref(s), never applied to their working tree.`
+          : ''
+      if (outcome.diverged) {
+        const branch = await resolveSyncBranch(worktree)
+        return `Pushed the user's local state to the sync repo, but the sandbox clone at ${destDir} has diverging commits or uncommitted changes and was left untouched. To take the update, reconcile inside the sandbox (e.g. commit or stash local work, then merge 'origin/${branch}').${wipNote}`
+      }
+      return `Synced the user's local project state into the sandbox clone at ${destDir} and pulled any agent commits back to the user's machine.${wipNote}`
+    }
+    return `Uploaded the user's local project to the cloud volume mounted at ${destDir}. Files the agent changed on the volume were downloaded to the user's folder first (a file changed on both sides keeps the local version); then local file versions replaced the volume's copies.`
   }
 
   /**
@@ -145,6 +323,7 @@ export class TensorlakeSessionManager {
   private async ensureProjectAvailable(sandboxId: string, projectId: string, worktree: string): Promise<void> {
     if (this.synced.has(sandboxId)) {
       this.refreshGitCredentialIfStale(sandboxId, projectId, worktree)
+      this.maybeResyncIfLocalChanged(sandboxId, projectId, worktree)
       return
     }
     if (resolveSyncMode(worktree) === 'off') {
@@ -213,21 +392,39 @@ export class TensorlakeSessionManager {
    * agent pushed nothing costs one cheap fetch. Only sessions that actually
    * have a sandbox in this process trigger it, and only in git mode.
    */
-  async syncBack(sessionId: string, projectId: string, worktree: string): Promise<void> {
-    if (!this.cache.has(sessionId)) return
-    if (resolveSyncMode(worktree) !== 'git') return
+  async syncBack(sessionId: string, projectId: string, worktree: string): Promise<SyncBackReport | VolumeSyncBack | undefined> {
+    const cached = this.cache.get(sessionId)
+    if (!cached) return
+    const mode = resolveSyncMode(worktree)
+    if (mode !== 'git' && mode !== 'volume') return
     const failedAt = this.syncBackFailedAt.get(worktree)
     if (failedAt !== undefined && Date.now() - failedAt < TensorlakeSessionManager.SYNC_RETRY_COOLDOWN_MS) return
     const existing = this.syncBackInflight.get(worktree)
     if (existing) return existing
-    const run = this._syncBack(worktree, projectId).finally(() => this.syncBackInflight.delete(worktree))
+    const run = (
+      mode === 'git'
+        ? this._syncBack(worktree, projectId, cached.sandboxId)
+        : this._syncBackVolume(worktree, projectId, cached.sandboxId)
+    ).finally(() => this.syncBackInflight.delete(worktree))
     this.syncBackInflight.set(worktree, run)
     return run
   }
 
-  private async _syncBack(worktree: string, projectId: string): Promise<void> {
+  private async _syncBack(worktree: string, projectId: string, sandboxId: string): Promise<SyncBackReport | undefined> {
+    // Capture the sandbox's uncommitted changes onto the sync repo's wip
+    // scratch ref first, so the fetch below brings committed and uncommitted
+    // work home in one pass. Failures never block the committed sync-back.
     try {
-      const result = await syncBackFromSyncRepo(this.client.getApiKey(), worktree, projectId)
+      const captured = await captureSandboxWip(this.client, sandboxId, this.projectDir(worktree))
+      if (captured === 'pushed' || captured === 'cleared') {
+        logger.info(`Sync-back: ${captured} uncommitted-sandbox-changes capture for sandbox ${sandboxId}`)
+      }
+    } catch (err: any) {
+      logger.warn(`Could not capture uncommitted sandbox changes: ${err?.message ?? err}`)
+    }
+    try {
+      const report = await syncBackFromSyncRepo(this.client.getApiKey(), worktree, projectId)
+      const result = report.committed
       if (result.kind === 'fast-forwarded') {
         this.lastStagedOid.delete(worktree)
         logger.info(`Sync-back: fast-forwarded local ${result.branch} by ${result.commits} agent commit(s)`)
@@ -245,9 +442,82 @@ export class TensorlakeSessionManager {
           variant: 'warning',
         })
       }
+      this.reportStagedWip(worktree, report)
+      return report
     } catch (err: any) {
       this.syncBackFailedAt.set(worktree, Date.now())
       logger.warn(`Sync-back from sync repo failed: ${err?.message ?? err}`)
+      return undefined
+    }
+  }
+
+  /**
+   * Volume-mode sync-back: download files the agent changed on the volume
+   * into the local folder (idle turns and the sync tool). Skipped while an
+   * upload for the same sandbox is in flight — both rewrite the manifest.
+   */
+  private async _syncBackVolume(worktree: string, projectId: string, sandboxId: string): Promise<VolumeSyncBack | undefined> {
+    if (this.syncInflight.has(sandboxId)) return undefined
+    try {
+      const result = await syncBackFromVolume(this.client.getApiKey(), worktree, projectId, this.storageDir)
+      this.reportVolumeSyncBack(worktree, result)
+      return result
+    } catch (err: any) {
+      this.syncBackFailedAt.set(worktree, Date.now())
+      logger.warn(`Volume sync-back failed: ${err?.message ?? err}`)
+      return undefined
+    }
+  }
+
+  /** Toast what a volume sync-back changed. Conflicts fire once per remote change. */
+  private reportVolumeSyncBack(worktree: string, result: VolumeSyncBack): void {
+    if (result.downloaded > 0) {
+      logger.info(`Volume sync-back: downloaded ${result.downloaded} file(s) into ${worktree}`)
+      toast.show({
+        title: 'Agent files downloaded',
+        message: `${result.downloaded} file(s) the agent changed were downloaded into ${worktree}.`,
+        variant: 'success',
+      })
+    }
+    if (result.conflicts.length > 0) {
+      const shown = result.conflicts.slice(0, 3).join(', ')
+      const more = result.conflicts.length > 3 ? `, +${result.conflicts.length - 3} more` : ''
+      logger.warn(`Volume sync-back: ${result.conflicts.length} conflict(s) kept local: ${result.conflicts.join(', ')}`)
+      toast.show({
+        title: 'Sync-back conflicts',
+        message: `${result.conflicts.length} file(s) changed both locally and in the sandbox; your local versions were kept: ${shown}${more}. Run a sync to make your versions win.`,
+        variant: 'warning',
+      })
+    }
+    if (result.deletedRemotely > 0) {
+      logger.info(`Volume sync-back: ${result.deletedRemotely} file(s) deleted on the volume; local copies kept`)
+    }
+  }
+
+  /**
+   * Toast each new wip capture staged on a local tensorlake-wip/* ref. The
+   * changes are deliberately never applied to the user's working tree — the
+   * toast tells them how to look at and take the work themselves.
+   */
+  private reportStagedWip(worktree: string, report: SyncBackReport): void {
+    const seen = new Set<string>()
+    for (const wip of report.wip) {
+      const key = `${worktree}\0${wip.branch}`
+      seen.add(key)
+      if (this.lastWipOid.get(key) === wip.oid) continue
+      this.lastWipOid.set(key, wip.oid)
+      const count = wip.files > 0 ? `${wip.files} file(s) of uncommitted` : 'Uncommitted'
+      logger.info(`Sync-back: staged uncommitted sandbox changes on ${wip.ref} (${wip.oid.slice(0, 8)})`)
+      toast.show({
+        title: 'Uncommitted sandbox work staged',
+        message: `${count} agent changes are on '${wip.ref}' (not applied to your tree). View: git diff ${wip.ref}~ ${wip.ref} — take them: git cherry-pick -n ${wip.ref}`,
+        variant: 'info',
+      })
+    }
+    // Captures cleared on the sync repo were pruned locally; forget them so a
+    // later capture on the same branch is reported again.
+    for (const key of this.lastWipOid.keys()) {
+      if (key.startsWith(`${worktree}\0`) && !seen.has(key)) this.lastWipOid.delete(key)
     }
   }
 

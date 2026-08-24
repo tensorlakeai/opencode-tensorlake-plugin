@@ -21,6 +21,7 @@ export async function systemPromptTransform(ctx: PluginInput, workDir: string, p
       lines.push(
         `The local project is synced into the sandbox as a git clone at: ${projectDir} (branch: ${branch})`,
         `Work in ${projectDir} on branch '${branch}'. Commit and push to 'origin ${branch}' to persist changes; pushed commits are pulled back into the user's local checkout automatically.`,
+        "If the user mentions local edits, commits, or a branch switch you cannot see, run the 'sync' tool to bring their latest local state into the sandbox.",
       )
     } else if (mode === 'mount') {
       lines.push(
@@ -31,6 +32,7 @@ export async function systemPromptTransform(ctx: PluginInput, workDir: string, p
       lines.push(
         `The local project is mounted into the sandbox on a cloud volume at: ${projectDir}`,
         `Work in ${projectDir}. Writes there are persisted automatically.`,
+        "If the user mentions local edits you cannot see, run the 'sync' tool to upload their latest local files (it replaces the volume's copies of those files).",
       )
     } else {
       lines.push(`The working directory is: ${workDir}`, `Put all project files in ${workDir}.`)

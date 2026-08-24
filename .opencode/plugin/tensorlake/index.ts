@@ -32,9 +32,14 @@ function suspendAndExit(signal: string) {
 process.on('SIGTERM', () => suspendAndExit('SIGTERM'))
 process.on('SIGINT', () => suspendAndExit('SIGINT'))
 
-async function tensorlakePlugin(ctx: PluginInput) {
+async function tensorlakePlugin(ctx: PluginInput, options?: Record<string, unknown>) {
   toast.initialize(ctx.client?.tui)
   const { worktree } = resolveProjectContext(ctx)
+  // Post-sync setup command (dependency install, seed data). Configured as a
+  // plugin option in opencode.json — ["tensorlake-opencode", {"setup": "npm ci"}]
+  // — so it can live in the project's own opencode.json; the env var wins.
+  const setup = process.env.TENSORLAKE_SETUP_COMMAND ?? (typeof options?.setup === 'string' ? options.setup : undefined)
+  sessionManager.setSetupCommand(setup)
   // Resolve the sync mode once, before anything reads it: detecting a local
   // Tensorlake mount needs the CLI, and every later read is synchronous.
   await detectSyncMode(worktree)

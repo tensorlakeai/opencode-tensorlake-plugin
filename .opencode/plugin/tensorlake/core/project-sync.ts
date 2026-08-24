@@ -1,4 +1,5 @@
-import { existsSync, readdirSync, lstatSync, statSync, unlinkSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { createHash } from 'crypto'
+import { existsSync, readdirSync, lstatSync, statSync, unlinkSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, basename, dirname } from 'path'
 import { posix } from 'path'
@@ -6,7 +7,7 @@ import { tmpdir } from 'os'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { RepositoryClient, FilesystemClient, CloudClient } from 'tensorlake'
-import type { FileSystemMount } from 'tensorlake'
+import type { FileSystemMount, FileEntry } from 'tensorlake'
 import { logger } from './logger.js'
 import type { TensorlakeClient } from './client.js'
 
@@ -232,8 +233,11 @@ function isMountPoint(path: string): boolean {
 /**
  * Name of the Tensorlake filesystem mounted at `path`, or undefined when the
  * path is not a Tensorlake mount (a plain folder, or some other mounted
- * volume). Served by `tl fs status`: the FUSE/FSKit mount daemon ships only
- * in the CLI, so there is no SDK call for this.
+ * volume). The SDK's FilesystemClient.mountStatus() answers the same question,
+ * but constructing that client requires cloud credentials and project scope —
+ * and this probe runs at plugin startup, before any of that is guaranteed, for
+ * a purely local check. So the CLI is asked directly, parsing the same fields
+ * the SDK does.
  */
 async function mountedFileSystem(path: string): Promise<string | undefined> {
   const cli = await findFsCli()
@@ -260,9 +264,12 @@ async function mountedFileSystem(path: string): Promise<string | undefined> {
   return name
 }
 
-/** The `tl` binary, from PATH or its default install location. */
+/** The `tl` binary: TENSORLAKE_CLI override, PATH, or the default install location — the SDK's own search order. */
 async function findFsCli(): Promise<string | undefined> {
-  for (const candidate of ['tl', join(homedir(), '.tensorlake', 'bin', 'tl')]) {
+  const candidates = process.env.TENSORLAKE_CLI
+    ? [process.env.TENSORLAKE_CLI, 'tl', join(homedir(), '.tensorlake', 'bin', 'tl')]
+    : ['tl', join(homedir(), '.tensorlake', 'bin', 'tl')]
+  for (const candidate of candidates) {
     try {
       await execFileAsync(candidate, ['fs', '--help'], { timeout: 15_000 })
       return candidate
@@ -462,6 +469,32 @@ async function buildUncommittedPatch(worktree: string): Promise<string | null> {
 }
 
 /**
+ * Compact fingerprint of the local repo state that inbound sync replicates:
+ * branch, HEAD, and a hash of the uncommitted patch. Two equal fingerprints
+ * mean an inbound re-sync would be a no-op. Null when the state cannot be
+ * read (callers then skip re-sync rather than churn).
+ */
+export async function localGitFingerprint(worktree: string): Promise<string | null> {
+  try {
+    const branch = await resolveSyncBranch(worktree)
+    let head = ''
+    try {
+      head = (await localGit(worktree, ['rev-parse', 'HEAD'])).trim()
+    } catch {
+      // no commits yet — the snapshot path syncs the worktree instead
+    }
+    // An oversized patch returns null and so hashes like a clean tree: such
+    // changes are not synced either way, and must not trigger re-sync churn.
+    const patch = head ? await buildUncommittedPatch(worktree) : null
+    const patchHash = patch ? createHash('sha1').update(patch).digest('hex') : ''
+    return `${branch}\n${head}\n${patchHash}`
+  } catch (err) {
+    logger.warn(`Could not fingerprint local repo state: ${err}`)
+    return null
+  }
+}
+
+/**
  * Replicate uncommitted local changes into the sandbox working tree without
  * committing them, so the sandbox matches the laptop's exact state. Applied
  * only when the sandbox tree is clean and at the same HEAD as the laptop —
@@ -509,6 +542,10 @@ async function applyUncommittedChanges(
  * the sync repo inside the sandbox at `destDir`, and finally replay uncommitted
  * local changes onto the sandbox working tree. A repo with no commits yet
  * falls back to a single snapshot commit via pushWorktree.
+ *
+ * Returns 'synced' when the sandbox clone now matches the pushed state, and
+ * 'diverged' when the clone has its own commits or changes and was left alone
+ * (the pushed state is still on its 'origin' remote).
  */
 export async function syncGitProject(
   client: TensorlakeClient,
@@ -517,7 +554,7 @@ export async function syncGitProject(
   worktree: string,
   projectId: string,
   destDir: string,
-): Promise<void> {
+): Promise<'synced' | 'diverged'> {
   const repos = RepositoryClient.forCloud(await cloudOptions(apiKey))
   try {
     const repo = syncResourceName(projectId)
@@ -590,12 +627,13 @@ export async function syncGitProject(
       logger.warn(
         `Sandbox clone at ${destDir} has commits or changes that diverge from the pushed project; left untouched instead of resetting. Delete the session's sandbox to start from a fresh clone.`,
       )
-    } else {
-      logger.info(`Project cloned into sandbox at ${destDir}`)
-      if (localHead) {
-        await applyUncommittedChanges(client, sandboxId, worktree, destDir, localHead)
-      }
+      return 'diverged'
     }
+    logger.info(`Project cloned into sandbox at ${destDir}`)
+    if (localHead) {
+      await applyUncommittedChanges(client, sandboxId, worktree, destDir, localHead)
+    }
+    return 'synced'
   } finally {
     repos.close()
   }
@@ -646,26 +684,42 @@ export type SyncBackResult =
   | { kind: 'fast-forwarded'; branch: string; commits: number; oid: string }
   | { kind: 'staged'; branch: string; ref: string; commits: number; oid: string; reason: string }
 
+/** One uncommitted-sandbox-changes capture staged on a local scratch ref. */
+export type WipStaged = { branch: string; ref: string; oid: string; files: number }
+
+/** Everything one sync-back pass brought home: committed work plus WIP captures. */
+export type SyncBackReport = { committed: SyncBackResult; wip: WipStaged[] }
+
+// Scratch namespace (on the sync repo and locally) holding synthetic commits
+// that capture a sandbox clone's uncommitted working tree. Kept outside
+// refs/heads and refs/remotes so no branch or fetch workflow ever sees them
+// as real history.
+const WIP_REF_PREFIX = 'refs/tensorlake-wip/'
+
 /**
- * Pull agent commits from the sync repo back into the local repository.
+ * Pull agent work from the sync repo back into the local repository.
  * Fetches every sync repo branch into refs/remotes/tensorlake/* (so nothing an
  * agent pushed is ever stranded on the sync repo), then fast-forwards the local
  * sync branch when that is safe. Unsafe cases — a dirty worktree or diverged
  * histories — leave the commits on the tensorlake/<branch> tracking ref for
  * the user to merge deliberately; the local checkout is never disturbed.
+ * Uncommitted sandbox changes captured by {@link captureSandboxWip} arrive in
+ * the same fetch and are only ever staged on local tensorlake-wip/* scratch
+ * refs — they are never applied to the user's working tree.
  */
 export async function syncBackFromSyncRepo(
   apiKey: string,
   worktree: string,
   projectId: string,
-): Promise<SyncBackResult> {
+): Promise<SyncBackReport> {
   const branch = await resolveSyncBranch(worktree)
   const repo = syncResourceName(projectId)
   const repos = RepositoryClient.forCloud(await cloudOptions(apiKey))
   try {
     const cred = await repos.credential(repo)
     // --prune drops tracking refs for branches deleted (or recreated) on the
-    // sync repo, so a stale tensorlake/* ref can't masquerade as agent work.
+    // sync repo, so a stale tensorlake/* ref can't masquerade as agent work;
+    // it likewise drops a local wip ref once the sandbox clears its capture.
     await localGit(worktree, [
       '-c',
       gitAuthConfig(cred),
@@ -675,11 +729,19 @@ export async function syncBackFromSyncRepo(
       '--prune',
       repos.url(repo),
       '+refs/heads/*:refs/remotes/tensorlake/*',
+      `+${WIP_REF_PREFIX}*:${WIP_REF_PREFIX}*`,
     ])
   } finally {
     repos.close()
   }
 
+  const committed = await reconcileCommitted(worktree, branch)
+  const wip = await stagedWipRefs(worktree)
+  return { committed, wip }
+}
+
+/** Fast-forward or stage the sync repo's committed work, post-fetch. */
+async function reconcileCommitted(worktree: string, branch: string): Promise<SyncBackResult> {
   const trackingRef = `refs/remotes/tensorlake/${branch}`
   const shortRef = `tensorlake/${branch}`
   let syncRepoOid: string
@@ -724,6 +786,84 @@ export async function syncBackFromSyncRepo(
 
   await localGit(worktree, ['merge', '--ff-only', '--quiet', syncRepoOid])
   return { kind: 'fast-forwarded', branch, commits, oid: syncRepoOid }
+}
+
+/** The wip captures currently staged on local tensorlake-wip/* refs. */
+async function stagedWipRefs(worktree: string): Promise<WipStaged[]> {
+  const out = await localGit(worktree, ['for-each-ref', '--format=%(refname)%00%(objectname)', WIP_REF_PREFIX.slice(0, -1)])
+  const staged: WipStaged[] = []
+  for (const line of out.split('\n')) {
+    const [refname, oid] = line.split('\0')
+    if (!refname || !oid) continue
+    const branch = refname.slice(WIP_REF_PREFIX.length)
+    let files = 0
+    try {
+      const names = await localGit(worktree, ['diff', '--name-only', `${oid}^`, oid])
+      files = names.split('\n').filter((name) => name.trim() !== '').length
+    } catch {
+      // parentless capture (repo synced as a snapshot) — file count unknown
+    }
+    // Short form resolves via git's refs/<name> lookup: 'tensorlake-wip/x'
+    // -> refs/tensorlake-wip/x, so the ref works in user-facing commands.
+    staged.push({ branch, ref: `tensorlake-wip/${branch}`, oid, files })
+  }
+  return staged
+}
+
+export type WipCaptureResult = 'pushed' | 'unchanged' | 'clean' | 'cleared' | 'skipped'
+
+/**
+ * Capture the sandbox clone's uncommitted changes (modified + untracked) as a
+ * synthetic commit and push it to the sync repo's tensorlake-wip/<branch>
+ * scratch ref, where the next sync-back fetch stages it locally. Built against
+ * a temporary index, so the sandbox's real index and working tree are never
+ * touched — exactly the laptop-side buildUncommittedPatch technique. A clean
+ * tree clears a previously pushed capture; an unchanged tree pushes nothing.
+ */
+export async function captureSandboxWip(
+  client: TensorlakeClient,
+  sandboxId: string,
+  destDir: string,
+): Promise<WipCaptureResult> {
+  const script = [
+    `cd '${destDir}'`,
+    'git rev-parse -q --verify HEAD >/dev/null 2>&1 || { echo TENSORLAKE_WIP_SKIPPED; exit 0; }',
+    'branch="$(git branch --show-current)"',
+    '[ -n "$branch" ] || { echo TENSORLAKE_WIP_SKIPPED; exit 0; }',
+    'if [ -z "$(git status --porcelain)" ]; then',
+    '  if [ -f .git/tensorlake-wip-tree ]; then',
+    // The remote ref may already be gone (repo recreated); the marker is
+    // removed either way so a delete failure cannot retry forever.
+    '    git push --quiet origin ":refs/tensorlake-wip/$branch" >/dev/null 2>&1 || true',
+    '    rm -f .git/tensorlake-wip-tree',
+    '    echo TENSORLAKE_WIP_CLEARED',
+    '  else',
+    '    echo TENSORLAKE_WIP_CLEAN',
+    '  fi',
+    '  exit 0',
+    'fi',
+    'GIT_INDEX_FILE="$(mktemp)" || exit 1',
+    'export GIT_INDEX_FILE',
+    'git read-tree HEAD || exit 1',
+    'git add -A || exit 1',
+    'tree="$(git write-tree)" || exit 1',
+    'rm -f "$GIT_INDEX_FILE"; unset GIT_INDEX_FILE',
+    `if [ "$tree" = "$(git rev-parse 'HEAD^{tree}')" ]; then echo TENSORLAKE_WIP_CLEAN; exit 0; fi`,
+    'if [ "$tree" = "$(cat .git/tensorlake-wip-tree 2>/dev/null)" ]; then echo TENSORLAKE_WIP_UNCHANGED; exit 0; fi',
+    `commit="$(git commit-tree "$tree" -p HEAD -m 'Uncommitted sandbox changes (captured by tensorlake-opencode)')" || exit 1`,
+    'git push --quiet origin "+$commit:refs/tensorlake-wip/$branch" || exit 1',
+    `printf '%s\\n' "$tree" > .git/tensorlake-wip-tree`,
+    'echo TENSORLAKE_WIP_PUSHED',
+  ].join('\n')
+  const result = await client.executeCommand(sandboxId, script, '/', 120_000)
+  if (result.exitCode !== 0) {
+    throw new Error(`wip capture failed (exit ${result.exitCode}): ${redactAuth(result.stderr || result.stdout)}`)
+  }
+  if (result.stdout.includes('TENSORLAKE_WIP_PUSHED')) return 'pushed'
+  if (result.stdout.includes('TENSORLAKE_WIP_UNCHANGED')) return 'unchanged'
+  if (result.stdout.includes('TENSORLAKE_WIP_CLEARED')) return 'cleared'
+  if (result.stdout.includes('TENSORLAKE_WIP_SKIPPED')) return 'skipped'
+  return 'clean'
 }
 
 /**
@@ -796,10 +936,12 @@ export async function ensureVolumeWithProject(
   const { files, present } = collectFiles(worktree)
   const count = Object.keys(files).length
   const manifestPath = syncManifestPath(manifestDir, name)
-  const stale = staleRemotePaths(readSyncManifest(manifestPath), present)
+  const manifest = readVolumeManifest(manifestPath)
+  const stale = staleRemotePaths(manifest.paths, present)
   logger.info(`Uploading ${count} files from ${worktree} to volume ${name}`)
+  let version: string | null = null
   if (count > 0) {
-    await fs.writeFilesFromPaths(files, 'Sync from OpenCode')
+    version = (await fs.writeFilesFromPaths(files, 'Sync from OpenCode')).versionId
   }
 
   // Drop previously uploaded paths that no longer exist locally, so local
@@ -810,23 +952,191 @@ export async function ensureVolumeWithProject(
   if (stale.length > 0) {
     try {
       logger.info(`Removing ${stale.length} locally deleted files from volume ${name}`)
-      await fs.writeFiles({}, 'Sync from OpenCode (remove deleted files)', stale)
+      version = (await fs.writeFiles({}, 'Sync from OpenCode (remove deleted files)', stale)).versionId
+      for (const path of stale) {
+        delete manifest.files[path]
+        delete manifest.localHash[path]
+      }
     } catch (err) {
       logger.warn(`Failed to remove deleted files from volume ${name}: ${err}`)
       undeleted = stale
     }
   }
-  writeSyncManifest(manifestPath, [...Object.keys(files), ...undeleted])
 
   // Scrub the manifest older versions wrote into the volume root, where every
   // sandbox agent could see and commit it.
   try {
-    await fs.deleteFile(LEGACY_VOLUME_MANIFEST_PATH, 'Remove legacy sync manifest')
+    version = (await fs.deleteFile(LEGACY_VOLUME_MANIFEST_PATH, 'Remove legacy sync manifest')).versionId
   } catch {
     // already gone — the common case
   }
 
+  // Content hashes of what was just uploaded: sync-back uses them to tell
+  // "the user changed this file since" apart from "safe to overwrite".
+  for (const [remotePath, localPath] of Object.entries(files)) {
+    try {
+      manifest.localHash[remotePath] = sha1File(localPath)
+    } catch (err) {
+      logger.warn(`Could not hash ${localPath}: ${err}`)
+    }
+  }
+
+  // Record the volume's content ids at this version as the sync-back
+  // baseline. Anything the volume holds right now is treated as already
+  // seen — which is why callers must download pending agent changes BEFORE
+  // uploading. A failed walk keeps the old baseline (less pruning, no harm).
+  try {
+    if (version === null) version = (await fs.status()).versionId
+    if (version) {
+      const tree = await walkVolumeTree(fs, version, manifest)
+      manifest.files = tree.files
+      manifest.dirs = tree.dirs
+      manifest.versionId = version
+    }
+  } catch (err) {
+    manifest.versionId = undefined
+    logger.warn(`Could not record volume baseline for ${name}: ${err}`)
+  }
+
+  manifest.paths = [...Object.keys(files), ...undeleted]
+  writeVolumeManifest(manifestPath, manifest)
+
   return { fileSystemId: name, mountPath }
+}
+
+export type VolumeSyncBack = { downloaded: number; conflicts: string[]; deletedRemotely: number }
+
+/**
+ * Download files the agent changed on the project's cloud volume into the
+ * local worktree. One `status()` call answers "anything new?"; a changed head
+ * is diffed with a tree walk that prunes every directory whose server-side
+ * contentId is unchanged. A local file is only ever overwritten when its
+ * content still matches what the last sync recorded (`localHash`) — a file
+ * the user edited too is skipped and reported as a conflict, and files
+ * deleted on the volume are never deleted locally.
+ */
+export async function syncBackFromVolume(
+  apiKey: string,
+  worktree: string,
+  projectId: string,
+  manifestDir: string,
+): Promise<VolumeSyncBack> {
+  const none: VolumeSyncBack = { downloaded: 0, conflicts: [], deletedRemotely: 0 }
+  const name = syncResourceName(projectId)
+  const manifestPath = syncManifestPath(manifestDir, name)
+  const manifest = readVolumeManifest(manifestPath)
+  const fsClient = new FilesystemClient(await cloudOptions(apiKey))
+  let fs
+  try {
+    fs = await fsClient.get(name)
+  } catch {
+    // No volume yet — nothing to pull.
+    return none
+  }
+  const head = (await fs.status()).versionId
+  if (!head || head === manifest.versionId) return none
+
+  const tree = await walkVolumeTree(fs, head, manifest)
+  let downloaded = 0
+  const conflicts: string[] = []
+  for (const entry of tree.changed) {
+    if (!isSafeRelativePath(entry.path)) {
+      logger.warn(`Sync-back: refusing unsafe path from volume ${name}: ${entry.path}`)
+      continue
+    }
+    if (entry.size !== null && entry.size > MAX_FILE_BYTES) {
+      logger.warn(`Sync-back: skipping ${entry.path} (${entry.size} bytes > ${MAX_FILE_BYTES})`)
+      continue
+    }
+    const localPath = join(worktree, entry.path)
+    if (existsSync(localPath)) {
+      const recorded = manifest.localHash[entry.path]
+      let current: string
+      try {
+        current = sha1File(localPath)
+      } catch {
+        // Unreadable, or a directory now sits where a file was — hands off.
+        conflicts.push(entry.path)
+        continue
+      }
+      if (recorded === undefined || current !== recorded) {
+        conflicts.push(entry.path)
+        continue
+      }
+    }
+    const data = await fs.readFile(entry.path, head)
+    if (data.byteLength > MAX_FILE_BYTES) {
+      logger.warn(`Sync-back: skipping ${entry.path} (${data.byteLength} bytes > ${MAX_FILE_BYTES})`)
+      continue
+    }
+    mkdirSync(dirname(localPath), { recursive: true })
+    writeFileSync(localPath, Buffer.from(data))
+    if (entry.executable) chmodSync(localPath, 0o755)
+    manifest.localHash[entry.path] = createHash('sha1').update(Buffer.from(data)).digest('hex')
+    downloaded++
+  }
+
+  // Files deleted on the volume: forget their sync state but keep the local
+  // copy — deleting local files behind the user's back is not worth the risk.
+  let deletedRemotely = 0
+  for (const path of Object.keys(manifest.files)) {
+    if (!(path in tree.files)) {
+      deletedRemotely++
+      delete manifest.localHash[path]
+      logger.info(`Sync-back: ${path} was deleted on volume ${name}; the local copy was kept`)
+    }
+  }
+
+  manifest.files = tree.files
+  manifest.dirs = tree.dirs
+  manifest.versionId = head
+  writeVolumeManifest(manifestPath, manifest)
+  return { downloaded, conflicts, deletedRemotely }
+}
+
+type VolumeTree = { files: Record<string, string>; dirs: Record<string, string>; changed: FileEntry[] }
+
+/**
+ * List the volume's tree at one pinned version, skipping every directory
+ * whose contentId matches the previous walk (its old entries are copied
+ * forward), regenerable SKIP_DIRS, and symlinks. `changed` holds the file
+ * entries whose contentId moved off the previous baseline.
+ */
+async function walkVolumeTree(
+  fs: { listFiles(dirPath?: string, version?: string): Promise<FileEntry[]> },
+  version: string,
+  prev: { files: Record<string, string>; dirs: Record<string, string> },
+): Promise<VolumeTree> {
+  const files: Record<string, string> = {}
+  const dirs: Record<string, string> = {}
+  const changed: FileEntry[] = []
+  const copyForward = (dirPath: string) => {
+    const prefix = `${dirPath}/`
+    for (const [path, id] of Object.entries(prev.files)) if (path.startsWith(prefix)) files[path] = id
+    for (const [path, id] of Object.entries(prev.dirs)) if (path.startsWith(prefix)) dirs[path] = id
+  }
+  const stack = ['']
+  while (stack.length > 0) {
+    const dir = stack.pop()!
+    const entries = await fs.listFiles(dir === '' ? undefined : dir, version)
+    for (const entry of entries) {
+      if (entry.kind === 'symlink') continue
+      if (entry.kind === 'directory') {
+        dirs[entry.path] = entry.contentId
+        if (SKIP_DIRS.has(entry.name)) continue
+        if (prev.dirs[entry.path] === entry.contentId) copyForward(entry.path)
+        else stack.push(entry.path)
+      } else {
+        files[entry.path] = entry.contentId
+        if (prev.files[entry.path] !== entry.contentId) changed.push(entry)
+      }
+    }
+  }
+  return { files, dirs, changed }
+}
+
+function sha1File(path: string): string {
+  return createHash('sha1').update(readFileSync(path)).digest('hex')
 }
 
 /**
@@ -846,26 +1156,53 @@ async function assertFileSystemExists(apiKey: string, name: string): Promise<voi
   }
 }
 
-/** Laptop-local record of the paths the last sync uploaded to a volume. */
+/**
+ * Laptop-local record of a volume's sync state: `paths` drives deletion
+ * propagation on upload (as before); `versionId`/`files`/`dirs` are the
+ * volume-side contentId baseline for sync-back; `localHash` is the sha1 each
+ * synced file had locally, the guard against overwriting a user edit.
+ */
+type VolumeManifest = {
+  paths: string[]
+  versionId?: string
+  files: Record<string, string>
+  dirs: Record<string, string>
+  localHash: Record<string, string>
+}
+
 function syncManifestPath(manifestDir: string, volumeName: string): string {
   return join(manifestDir, `${volumeName}.sync-manifest.json`)
 }
 
-function readSyncManifest(manifestPath: string): string[] {
+function stringRecord(value: unknown): Record<string, string> {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) return {}
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof v === 'string') out[k] = v
+  }
+  return out
+}
+
+function readVolumeManifest(manifestPath: string): VolumeManifest {
   try {
-    const parsed = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { paths?: unknown }
-    if (!Array.isArray(parsed.paths)) return []
-    return parsed.paths.filter((p): p is string => typeof p === 'string')
+    const parsed = JSON.parse(readFileSync(manifestPath, 'utf-8')) as Partial<VolumeManifest>
+    return {
+      // first sync, or a missing/corrupt manifest — never guess at deletions
+      paths: Array.isArray(parsed.paths) ? parsed.paths.filter((p): p is string => typeof p === 'string') : [],
+      versionId: typeof parsed.versionId === 'string' ? parsed.versionId : undefined,
+      files: stringRecord(parsed.files),
+      dirs: stringRecord(parsed.dirs),
+      localHash: stringRecord(parsed.localHash),
+    }
   } catch {
-    // first sync, or a missing/corrupt manifest — never guess at deletions
-    return []
+    return { paths: [], files: {}, dirs: {}, localHash: {} }
   }
 }
 
-function writeSyncManifest(manifestPath: string, paths: string[]): void {
+function writeVolumeManifest(manifestPath: string, manifest: VolumeManifest): void {
   try {
     mkdirSync(dirname(manifestPath), { recursive: true })
-    writeFileSync(manifestPath, JSON.stringify({ paths: [...new Set(paths)].sort() }))
+    writeFileSync(manifestPath, JSON.stringify({ ...manifest, paths: [...new Set(manifest.paths)].sort() }))
   } catch (err) {
     logger.warn(`Failed to write sync manifest ${manifestPath}: ${err}`)
   }

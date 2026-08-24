@@ -7,6 +7,7 @@ import { editTool } from './tools/edit.js'
 import { lsTool } from './tools/ls.js'
 import { globTool } from './tools/glob.js'
 import { grepTool } from './tools/grep.js'
+import { syncTool } from './tools/sync.js'
 
 export function createTensorlakeTools(
   sessionManager: TensorlakeSessionManager,
@@ -18,6 +19,7 @@ export function createTensorlakeTools(
     bash: bashTool(sessionManager, projectId, worktree, pluginCtx),
     bash_output: bashOutputTool(sessionManager, projectId, worktree, pluginCtx),
     bash_kill: bashKillTool(sessionManager, projectId, worktree, pluginCtx),
+    sync: syncTool(sessionManager, projectId, worktree, pluginCtx),
     read: readTool(sessionManager, projectId, worktree, pluginCtx),
     write: writeTool(sessionManager, projectId, worktree, pluginCtx),
     edit: editTool(sessionManager, projectId, worktree, pluginCtx),
