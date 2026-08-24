@@ -12,6 +12,8 @@ The plugin intercepts OpenCode's standard tools (`bash`, `read`, `write`, `edit`
 - **Background processes** — `bash` with `background=true` starts a long-running process in the sandbox (dev server, watcher) and returns its pid. Two extra tools, `bash_output` and `bash_kill`, let the model read new output and stop the process.
 - **Visibility** — sandbox events (created, connected, resumed, deleted) appear as TUI toasts, and all plugin activity is logged to `~/.local/share/opencode/log/tensorlake.log`.
 
+> **LSP stays local.** OpenCode's experimental LSP support runs language servers in the OpenCode process, against your local worktree — a plugin cannot redirect it into the sandbox. Diagnostics therefore describe your local files, which drift from the sandbox as the agent edits. Keep LSP off (`"lsp": {}` or the default) when you want everything to reflect the sandbox, and get diagnostics by running the project's own type-checker or linter through `bash`.
+
 ## Project sync
 
 The first time a sandbox is used (per OpenCode process), the plugin syncs your local project into it so the sandbox is not empty. The mode is chosen automatically:
@@ -119,7 +121,7 @@ The agent could simply `git clone` your GitHub repo inside the sandbox. The sync
 
 > **Branch naming.** The sync branch is whatever `git branch --show-current` reports on your machine when the sync runs — one name everywhere: local, sync repo, and sandbox. A detached HEAD (or a branch name that cannot be embedded safely) syncs as `main`. If you switch local branches, the next sandbox sync follows: a clean sandbox clone switches to the new branch; one with its own edits is left untouched.
 
-> If you rewrite local history (rebase, amend), the next sync recreates the sync repo from your rewritten history — any commits that existed only on the sync repo are discarded. The automatic sync-back makes this window small (agent commits normally reach your machine within a turn), but rebasing mid-turn while the agent still has unpushed or unfetched work can lose it. An existing sandbox clone can't fast-forward to rewritten history; delete the session's sandbox to get a fresh clone.
+> If you rewrite local history (rebase, amend), the next sync force-updates the sync branch on the sync repo from your rewritten history. Before it does, every ref on the sync repo is copied to a local `refs/tensorlake-rescue/*` ref, so agent commits that existed only there stay recoverable — the plugin logs the refs it kept; read them with `git log <ref>` and remove them with `git update-ref -d <ref>`. Other branches and wip captures on the sync repo are untouched. An existing sandbox clone can't fast-forward to rewritten history; delete the session's sandbox to get a fresh clone.
 
 ## Requirements
 

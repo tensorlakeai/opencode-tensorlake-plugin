@@ -75,6 +75,24 @@ export class TensorlakeSessionManager {
   // re-syncs from paying a probe roundtrip every time
   private readonly setupChecked = new Set<string>()
   private static readonly SETUP_TIMEOUT_MS = 900_000
+  // Background work that must finish before the process exits: inbound sync,
+  // setup command, sync-back, wip capture, volume download, sandbox creation.
+  // Suspending a sandbox (or exiting) mid-flight abandons agent work, so
+  // shutdown() drains this set first.
+  private readonly pending = new Set<Promise<void>>()
+  // Set once shutdown starts — stops new fire-and-forget work from being
+  // queued behind the drain.
+  private shuttingDown = false
+  // The single shutdown run; a second signal or event joins it.
+  private shutdownRun: Promise<void> | undefined
+  private static readonly DRAIN_TIMEOUT_MS = 15_000
+
+  /** Drain budget for shutdown; TENSORLAKE_SHUTDOWN_DRAIN_MS overrides it. */
+  private static drainBudgetMs(): number {
+    const raw = Number(process.env.TENSORLAKE_SHUTDOWN_DRAIN_MS)
+    if (Number.isFinite(raw) && raw >= 0) return raw
+    return TensorlakeSessionManager.DRAIN_TIMEOUT_MS
+  }
   public readonly workDir: string
   private readonly storageDir: string
 
@@ -213,7 +231,7 @@ export class TensorlakeSessionManager {
     const promise = this.syncProject(sandboxId, projectId, worktree, opts)
       .finally(() => this.syncInflight.delete(sandboxId))
     this.syncInflight.set(sandboxId, promise)
-    return promise
+    return this.track(promise)
   }
 
   /**
@@ -300,18 +318,21 @@ export class TensorlakeSessionManager {
    */
   private maybeResyncIfLocalChanged(sandboxId: string, projectId: string, worktree: string): void {
     if (resolveSyncMode(worktree) !== 'git') return
+    if (this.shuttingDown) return
     if (this.syncInflight.has(sandboxId)) return
     const lastSynced = this.syncedFingerprint.get(sandboxId)
     if (typeof lastSynced !== 'string') return
     const checkedAt = this.resyncCheckedAt.get(sandboxId) ?? 0
     if (Date.now() - checkedAt < TensorlakeSessionManager.RESYNC_CHECK_INTERVAL_MS) return
     this.resyncCheckedAt.set(sandboxId, Date.now())
-    void (async () => {
-      const current = await localGitFingerprint(worktree)
-      if (!current || current === lastSynced) return
-      logger.info(`Local project changed since the last sync; re-syncing into sandbox ${sandboxId}`)
-      await this.syncProjectOnce(sandboxId, projectId, worktree, { force: true })
-    })().catch((err) => logger.warn(`Automatic re-sync failed: ${err}`))
+    void this.track(
+      (async () => {
+        const current = await localGitFingerprint(worktree)
+        if (!current || current === lastSynced) return
+        logger.info(`Local project changed since the last sync; re-syncing into sandbox ${sandboxId}`)
+        await this.syncProjectOnce(sandboxId, projectId, worktree, { force: true })
+      })(),
+    ).catch((err) => logger.warn(`Automatic re-sync failed: ${err}`))
   }
 
   /**
@@ -415,11 +436,12 @@ export class TensorlakeSessionManager {
    */
   private refreshGitCredentialIfStale(sandboxId: string, projectId: string, worktree: string): void {
     if (resolveSyncMode(worktree) !== 'git') return
+    if (this.shuttingDown) return
     const last = this.credRefreshedAt.get(sandboxId) ?? 0
     if (Date.now() - last < GIT_CREDENTIAL_REFRESH_MS) return
     // Claim the slot up front so concurrent tool calls don't stack refreshes.
     this.credRefreshedAt.set(sandboxId, Date.now())
-    refreshSandboxGitCredential(this.client, this.client.getApiKey(), sandboxId, projectId)
+    void this.track(refreshSandboxGitCredential(this.client, this.client.getApiKey(), sandboxId, projectId))
       .then(() => logger.info(`Refreshed git credential in sandbox ${sandboxId}`))
       .catch((err: any) => {
         this.credRefreshedAt.delete(sandboxId)
@@ -464,7 +486,7 @@ export class TensorlakeSessionManager {
       })
     this.syncBackInflight.set(key, run)
     this.syncBackTail.set(worktree, run)
-    return run
+    return this.track(run)
   }
 
   private async _syncBack(worktree: string, projectId: string, sandboxId: string): Promise<SyncBackReport | undefined> {
@@ -640,7 +662,7 @@ export class TensorlakeSessionManager {
       })
       .finally(() => this.inflight.delete(sessionId))
     this.inflight.set(sessionId, promise)
-    return promise
+    return this.track(promise)
   }
 
   // Login cannot validate the key (OpenCode masks it away from the plugin),
@@ -775,6 +797,80 @@ export class TensorlakeSessionManager {
     return entry
   }
 
+  /**
+   * Register background work so shutdown can wait for it. Returns the same
+   * promise, so callers keep their own error handling; the tracked copy never
+   * rejects.
+   */
+  private track<T>(promise: Promise<T>): Promise<T> {
+    const settled: Promise<void> = promise.then(
+      () => undefined,
+      () => undefined,
+    )
+    this.pending.add(settled)
+    void settled.then(() => this.pending.delete(settled))
+    return promise
+  }
+
+  /**
+   * Whether any tracked background work is still running. Signal handlers use
+   * it to keep the old synchronous exit path when there is nothing to drain.
+   */
+  hasPendingWork(): boolean {
+    return this.pending.size > 0
+  }
+
+  /**
+   * Wait for tracked background work, re-checking after each batch: a
+   * sync-back that was queued behind another one only appears in the set once
+   * the first finishes. Gives up (and says so) when the budget runs out
+   * rather than holding the exit open forever.
+   */
+  private async drainPending(timeoutMs: number): Promise<void> {
+    if (this.pending.size === 0) return
+    const deadline = Date.now() + timeoutMs
+    logger.info(`Shutdown: waiting for ${this.pending.size} pending task(s) to finish`)
+    while (this.pending.size > 0) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) break
+      const batch = Promise.all([...this.pending])
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const expiry = new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), remaining)
+      })
+      const outcome = await Promise.race([batch.then(() => 'done' as const), expiry])
+      if (timer) clearTimeout(timer)
+      if (outcome === 'timeout') break
+    }
+    if (this.pending.size > 0) {
+      logger.warn(`Shutdown drain timed out; ${this.pending.size} task(s) were abandoned`)
+    } else {
+      logger.info('Shutdown: pending tasks drained')
+    }
+  }
+
+  /**
+   * Finish (or time out) the work that carries agent changes between the
+   * sandbox and the user's machine, then suspend the sandboxes. Called from
+   * the signal handlers and from server.instance.disposed; the first call
+   * does the work and every later one joins it.
+   */
+  shutdown(reason: string, opts: { drainMs?: number } = {}): Promise<void> {
+    if (this.shutdownRun) return this.shutdownRun
+    this.shuttingDown = true
+    const drainMs = opts.drainMs ?? TensorlakeSessionManager.drainBudgetMs()
+    this.shutdownRun = (async () => {
+      logger.info(`Shutdown (${reason}): draining background work before suspend`)
+      try {
+        await this.drainPending(drainMs)
+      } catch (err) {
+        logger.warn(`Shutdown drain failed: ${err}`)
+      }
+      this.suspendAllSandboxes()
+    })()
+    return this.shutdownRun
+  }
+
   suspendAllSandboxes(): void {
     for (const [sessionId, { sandboxId }] of this.cache.entries()) {
       logger.info(`Suspending sandbox ${sandboxId} for session ${sessionId} (app exit)`)
@@ -787,7 +883,11 @@ export class TensorlakeSessionManager {
     }
   }
 
-  async deleteSandbox(sessionId: string, projectId: string, worktree?: string): Promise<void> {
+  deleteSandbox(sessionId: string, projectId: string, worktree?: string): Promise<void> {
+    return this.track(this._deleteSandbox(sessionId, projectId, worktree))
+  }
+
+  private async _deleteSandbox(sessionId: string, projectId: string, worktree?: string): Promise<void> {
     // Block new tool calls from resurrecting the session first, then wait for
     // an in-flight getSandbox: a delete that raced sandbox creation would
     // otherwise see no sandboxId, report success, and orphan the new sandbox.

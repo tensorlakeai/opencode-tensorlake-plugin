@@ -4,6 +4,7 @@ import { bashTool, bashOutputTool, bashKillTool } from './tools/bash.js'
 import { readTool } from './tools/read.js'
 import { writeTool } from './tools/write.js'
 import { editTool } from './tools/edit.js'
+import { multiEditTool } from './tools/multiedit.js'
 import { applyPatchTool } from './tools/apply-patch.js'
 import { lsTool } from './tools/ls.js'
 import { globTool } from './tools/glob.js'
@@ -24,6 +25,7 @@ export function createTensorlakeTools(
     read: readTool(sessionManager, projectId, worktree, pluginCtx),
     write: writeTool(sessionManager, projectId, worktree, pluginCtx),
     edit: editTool(sessionManager, projectId, worktree, pluginCtx),
+    multiedit: multiEditTool(sessionManager, projectId, worktree, pluginCtx),
     // Shadows OpenCode's built-in apply_patch, which writes to the LOCAL
     // filesystem and would otherwise bypass the sandbox entirely.
     apply_patch: applyPatchTool(sessionManager, projectId, worktree, pluginCtx),

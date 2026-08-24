@@ -1,5 +1,17 @@
 import { createHash } from 'crypto'
-import { existsSync, readdirSync, lstatSync, statSync, unlinkSync, readFileSync, writeFileSync, mkdirSync, chmodSync, realpathSync } from 'fs'
+import {
+  existsSync,
+  readdirSync,
+  lstatSync,
+  statSync,
+  unlinkSync,
+  renameSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  chmodSync,
+  realpathSync,
+} from 'fs'
 import { homedir } from 'os'
 import { join, basename, dirname, sep } from 'path'
 import { posix } from 'path'
@@ -321,18 +333,94 @@ async function syncRepoContainsLocalHead(
   }
 }
 
+// Scratch namespace the sync repo's refs are fetched into right before a push
+// that overwrites history, and the namespace the ones worth keeping are then
+// moved to. Both sit outside refs/heads, refs/remotes and the wip namespace, so
+// neither the user's branch workflows nor sync-back's --prune can touch them.
+const RESCUE_SCRATCH_PREFIX = 'refs/tensorlake-scratch/'
+const RESCUE_REF_PREFIX = 'refs/tensorlake-rescue/'
+
+/**
+ * Copy every ref on the sync repo into the local scratch namespace. Nothing an
+ * agent pushed — other branches, wip captures, the branch tip about to be
+ * overwritten — can then be lost by what follows. Rejects when the copy fails,
+ * so no destructive step runs without it.
+ */
+async function archiveSyncRepoRefs(repos: RepositoryClient, repo: string, worktree: string): Promise<void> {
+  const cred = await repos.credential(repo)
+  await localGit(worktree, [
+    '-c',
+    gitAuthConfig(cred),
+    'fetch',
+    '--quiet',
+    '--no-write-fetch-head',
+    // --prune keeps the scratch namespace a faithful copy of the sync repo as
+    // it is now; refs worth keeping have already been moved out of it.
+    '--prune',
+    await repos.url(repo),
+    `+refs/*:${RESCUE_SCRATCH_PREFIX}*`,
+  ])
+}
+
+/**
+ * Turn the scratch copies into durable rescue refs: drop the ones local HEAD
+ * already contains, keep the rest under refs/tensorlake-rescue/<oid>, and
+ * report them — they hold work that exists nowhere else on the laptop. Naming
+ * a rescue ref after its commit makes the move idempotent, so a later rewrite
+ * cannot overwrite what an earlier one saved.
+ */
+async function rescueArchivedRefs(worktree: string, repo: string): Promise<void> {
+  const out = await localGit(worktree, [
+    'for-each-ref',
+    '--format=%(refname)%00%(objectname)',
+    RESCUE_SCRATCH_PREFIX.slice(0, -1),
+  ])
+  const kept: string[] = []
+  for (const line of out.split('\n')) {
+    const [scratchRef, oid] = line.split('\0')
+    if (!scratchRef || !oid) continue
+    let redundant = false
+    try {
+      redundant = await isAncestor(worktree, oid, 'HEAD')
+    } catch {
+      // Indeterminate: keep the commit rather than drop work we cannot vouch for.
+    }
+    if (!redundant) {
+      const rescueRef = `${RESCUE_REF_PREFIX}${oid}`
+      const wasOn = scratchRef.slice(RESCUE_SCRATCH_PREFIX.length)
+      await localGit(worktree, ['update-ref', rescueRef, oid])
+      kept.push(`${rescueRef} (refs/${wasOn} on the sync repo)`)
+    }
+    await localGit(worktree, ['update-ref', '-d', scratchRef]).catch(() => {})
+  }
+  if (kept.length) {
+    logger.warn(
+      `Commits that were only on sync repo ${repo} are saved locally on ${kept.length} rescue ref(s): ${kept.join(', ')}. Read one with \`git log <ref>\` and drop it with \`git update-ref -d <ref>\` once it is handled.`,
+    )
+  }
+}
+
 /**
  * Push the local repository's real history (HEAD) to the sync repo's sync
  * branch, preserving commits, authors, and dates. A non-fast-forward rejection
  * has two causes that must be told apart: the sync repo being ahead of the laptop
  * (agents commit and push their work to it), in which case the push is simply
  * skipped, or local history having been rewritten by a rebase or amend, in
- * which case the sync repo is deleted, recreated, and pushed fresh.
+ * which case every sync repo ref is first copied to a local rescue ref and only
+ * the sync branch is then force-updated. Recreating the whole sync repo is the
+ * last resort, for a host that refuses the force push.
  */
 async function pushRealHistory(repos: RepositoryClient, repo: string, worktree: string, branch: string): Promise<void> {
-  const push = async () => {
+  const push = async (force = false) => {
     const cred = await repos.credential(repo)
-    await localGit(worktree, ['-c', gitAuthConfig(cred), 'push', '--quiet', await repos.url(repo), `HEAD:refs/heads/${branch}`])
+    await localGit(worktree, [
+      '-c',
+      gitAuthConfig(cred),
+      'push',
+      '--quiet',
+      await repos.url(repo),
+      `${force ? '+' : ''}HEAD:refs/heads/${branch}`,
+    ])
   }
   try {
     await push()
@@ -357,18 +445,40 @@ async function pushRealHistory(repos: RepositoryClient, repo: string, worktree: 
       )
       return
     }
-    logger.warn(
-      `Sync repo ${repo} rejected a non-fast-forward push and its ${branch} branch does not contain local HEAD (local history was rewritten); recreating the sync repo. Commits that existed only on the sync repo are discarded.`,
-    )
-    await repos.delete(repo)
-    await repos.create(repo, { defaultBranch: branch })
+    // Local history was rewritten. Save every sync repo ref locally first: the
+    // force push below overwrites the branch tip, and the recreate fallback
+    // drops other branches and wip refs too.
     try {
-      await push()
-    } catch (err2: any) {
+      await archiveSyncRepoRefs(repos, repo, worktree)
+    } catch (archiveErr: any) {
       throw new Error(
-        `git push after recreating sync repo ${repo} failed: ${redactAuth(`${err2?.stderr ?? ''} ${err2?.message ?? err2}`)}`,
+        `Sync repo ${repo} needs a history-overwriting push, but its refs could not be copied locally first; not overwriting it to avoid discarding remote-only commits: ${redactAuth(`${archiveErr?.stderr ?? ''} ${archiveErr?.message ?? archiveErr}`)}`,
       )
     }
+    logger.warn(
+      `Sync repo ${repo} rejected a non-fast-forward push and its ${branch} branch does not contain local HEAD (local history was rewritten); force-updating ${branch}. Every sync repo ref was copied locally first; any commit only the sync repo had is kept on a ${RESCUE_REF_PREFIX}* ref.`,
+    )
+    try {
+      await push(true)
+    } catch (forceErr: any) {
+      logger.warn(
+        `Force push to sync repo ${repo} was refused (${redactAuth(`${forceErr?.stderr ?? ''} ${forceErr?.message ?? forceErr}`)}); recreating the repo instead. Its branches and wip refs survive only on the local rescue refs.`,
+      )
+      await repos.delete(repo)
+      await repos.create(repo, { defaultBranch: branch })
+      try {
+        await push()
+      } catch (err2: any) {
+        throw new Error(
+          `git push after recreating sync repo ${repo} failed: ${redactAuth(`${err2?.stderr ?? ''} ${err2?.message ?? err2}`)}`,
+        )
+      }
+    }
+    await rescueArchivedRefs(worktree, repo).catch((rescueErr) => {
+      logger.warn(
+        `Sync repo refs were copied to ${RESCUE_SCRATCH_PREFIX}* but could not be moved to ${RESCUE_REF_PREFIX}*: ${rescueErr}`,
+      )
+    })
   }
 }
 
@@ -1019,6 +1129,7 @@ export async function syncBackFromVolume(
     return none
   }
   let downloaded = 0
+  let tmpSeq = 0
   const conflicts: string[] = []
   for (const entry of tree.changed) {
     if (!isSafeRelativePath(entry.path)) {
@@ -1035,25 +1146,9 @@ export async function syncBackFromVolume(
       conflicts.push(entry.path)
       continue
     }
-    if (existsSync(localPath)) {
-      const recorded = manifest.localHash[entry.path]
-      let current: string
-      try {
-        current = sha1File(localPath)
-      } catch {
-        // Unreadable, or a directory now sits where a file was — hands off.
-        conflicts.push(entry.path)
-        continue
-      }
-      if (recorded === undefined || current !== recorded) {
-        conflicts.push(entry.path)
-        continue
-      }
-    } else if (manifest.localHash[entry.path] !== undefined) {
-      // The file was synced before but the user has since deleted it locally.
-      // Recreating it would silently undo that deletion, so treat the local
-      // delete as the user's edit: keep it and report a conflict. Only files
-      // never seen locally are created as new.
+    const recorded = manifest.localHash[entry.path]
+    const before = localSyncState(localPath, recorded)
+    if (before === 'conflict') {
       conflicts.push(entry.path)
       continue
     }
@@ -1062,13 +1157,46 @@ export async function syncBackFromVolume(
       logger.warn(`Sync-back: skipping ${entry.path} (${data.byteLength} bytes > ${MAX_FILE_BYTES})`)
       continue
     }
+    // The download above is slow enough for the user to edit the file after
+    // the first check, so check again here. This leaves only a few syscalls
+    // between the last look at the file and the rename that replaces it.
+    if (localSyncState(localPath, recorded) !== before) {
+      logger.info(`Sync-back: ${entry.path} changed locally during the download; keeping the local copy`)
+      conflicts.push(entry.path)
+      continue
+    }
+    const buffer = Buffer.from(data)
     mkdirSync(dirname(localPath), { recursive: true })
-    writeFileSync(localPath, Buffer.from(data))
-    // Set or clear the exec bits while keeping the file's other permissions.
-    const mode = statSync(localPath).mode
-    const wanted = entry.executable ? mode | 0o111 : mode & ~0o111
-    if (wanted !== mode) chmodSync(localPath, wanted)
-    manifest.localHash[entry.path] = createHash('sha1').update(Buffer.from(data)).digest('hex')
+    // Write a temp file in the same directory and rename it over the
+    // destination. Rename is atomic, so a disk error or a killed process can
+    // never leave a half-written file in the worktree.
+    const tmpPath = join(dirname(localPath), `.${basename(localPath)}.tensorlake-${process.pid}-${tmpSeq++}.tmp`)
+    try {
+      writeFileSync(tmpPath, buffer)
+      // Keep the destination's permissions when it already exists, then set or
+      // clear the exec bits to match the volume.
+      let mode = statSync(tmpPath).mode
+      if (before === 'clean') {
+        try {
+          mode = statSync(localPath).mode
+        } catch {
+          // Gone after the check — keep the temp file's own mode.
+        }
+      }
+      const wanted = entry.executable ? mode | 0o111 : mode & ~0o111
+      if (wanted !== statSync(tmpPath).mode) chmodSync(tmpPath, wanted)
+      renameSync(tmpPath, localPath)
+    } catch (err) {
+      try {
+        unlinkSync(tmpPath)
+      } catch {
+        // Never created, or already renamed away.
+      }
+      logger.warn(`Sync-back: could not write ${entry.path}: ${err}`)
+      conflicts.push(entry.path)
+      continue
+    }
+    manifest.localHash[entry.path] = createHash('sha1').update(buffer).digest('hex')
     downloaded++
   }
 
@@ -1150,6 +1278,31 @@ async function walkVolumeTree(
 
 function sha1File(path: string): string {
   return createHash('sha1').update(readFileSync(path)).digest('hex')
+}
+
+/**
+ * Classify a sync-back destination against what the last sync recorded for it.
+ * `clean` means the local file still holds the synced content and may be
+ * replaced; `absent` means the path was never synced and nothing is there;
+ * `conflict` covers everything the user owns — an edited file, an untracked
+ * file, a non-regular file, and a synced file the user has since deleted
+ * (recreating it would silently undo that deletion). The result is also the
+ * before/after token for the re-check that guards the write.
+ */
+function localSyncState(localPath: string, recorded: string | undefined): 'absent' | 'clean' | 'conflict' {
+  let stats
+  try {
+    stats = lstatSync(localPath)
+  } catch {
+    return recorded === undefined ? 'absent' : 'conflict'
+  }
+  // A symlink or a directory where a file belongs is never written through.
+  if (!stats.isFile() || recorded === undefined) return 'conflict'
+  try {
+    return sha1File(localPath) === recorded ? 'clean' : 'conflict'
+  } catch {
+    return 'conflict'
+  }
 }
 
 /**

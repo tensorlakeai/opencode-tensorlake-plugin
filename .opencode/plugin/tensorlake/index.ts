@@ -19,14 +19,42 @@ const WORK_DIR = '/tmp/workspace'
 setLogFilePath(LOG_FILE)
 const sessionManager = new TensorlakeSessionManager(resolveApiKey, STORAGE_DIR, WORK_DIR)
 
-function suspendAndExit(signal: string) {
-  logger.info(`Received ${signal}, suspending sandboxes before exit`)
+let exitRequested = false
+
+function suspendNowAndExit(signal: string) {
   try {
     sessionManager.suspendAllSandboxes()
   } catch (err) {
     logger.error(`Failed to suspend sandboxes on ${signal}: ${err}`)
   }
   process.exit(0)
+}
+
+/**
+ * Exit path for SIGINT/SIGTERM. Background work carries agent changes between
+ * the sandbox and the user's machine (inbound sync, sync-back, uncommitted-work
+ * capture, volume download, setup), so it has to finish before the sandboxes
+ * are suspended — cutting it off loses the work. With nothing pending the old
+ * synchronous path is kept, so an idle exit is as fast (and as robust against
+ * another handler exiting first) as before. A second signal skips the wait.
+ */
+function suspendAndExit(signal: string) {
+  if (exitRequested) {
+    logger.warn(`Received ${signal} again, suspending without waiting for pending work`)
+    suspendNowAndExit(signal)
+    return
+  }
+  exitRequested = true
+  if (!sessionManager.hasPendingWork()) {
+    logger.info(`Received ${signal}, suspending sandboxes before exit`)
+    suspendNowAndExit(signal)
+    return
+  }
+  logger.info(`Received ${signal}, finishing pending work before suspending sandboxes`)
+  sessionManager
+    .shutdown(signal)
+    .catch((err) => logger.error(`Failed to shut down cleanly on ${signal}: ${err}`))
+    .finally(() => process.exit(0))
 }
 
 process.on('SIGTERM', () => suspendAndExit('SIGTERM'))

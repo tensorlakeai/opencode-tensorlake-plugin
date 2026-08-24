@@ -30,8 +30,10 @@ export async function eventHandlers(ctx: PluginInput, sessionManager: Tensorlake
         toast.show({ title: 'Delete failed', message: err?.message ?? 'Failed to delete sandbox.', variant: 'error' })
       }
     } else if (event.type === EVENT_TYPE_SERVER_INSTANCE_DISPOSED) {
+      // Let pending sync work finish before the sandboxes are suspended;
+      // shutdown() bounds the wait and suspends either way.
       try {
-        sessionManager.suspendAllSandboxes()
+        await sessionManager.shutdown('server.instance.disposed')
       } catch (err: any) {
         logger.error(`Failed to suspend sandboxes on exit: ${err}`)
       }
