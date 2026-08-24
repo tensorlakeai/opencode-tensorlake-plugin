@@ -1,6 +1,6 @@
 {
   "name": "tensorlake-opencode",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "Apache-2.0",
   "description": "OpenCode plugin that runs all sessions in Tensorlake sandboxes for isolated execution environments",
   "keywords": [
@@ -29,7 +29,7 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.18.21",
-    "tensorlake": "^0.5.112",
+    "tensorlake": "0.5.112",
     "xdg-basedir": "^5.1.0",
     "zod": "^4.2.1"
   },
