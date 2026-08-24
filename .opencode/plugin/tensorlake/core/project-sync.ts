@@ -6,7 +6,7 @@ import { posix } from 'path'
 import { tmpdir } from 'os'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
-import { RepositoryClient, FilesystemClient, CloudClient } from 'tensorlake'
+import { RepositoryClient, FilesystemClient } from 'tensorlake'
 import type { FileSystemMount, FileEntry } from 'tensorlake'
 import { logger } from './logger.js'
 import type { TensorlakeClient } from './client.js'
@@ -48,80 +48,12 @@ function apiUrl(): string | undefined {
   return process.env.TENSORLAKE_API_URL
 }
 
-type Scope = { organizationId: string; projectId: string }
-
-// Cached per key: the stored key can change without a restart (auth login in
-// another terminal), and a new key may belong to a different project.
-let cachedScope: { apiKey: string; scope: Scope } | null = null
-
-function pickId(value: unknown, keys: string[]): string | undefined {
-  if (value == null || typeof value !== 'object') return undefined
-  const obj = value as Record<string, unknown>
-  for (const key of keys) {
-    const candidate = obj[key]
-    if (typeof candidate === 'string' && candidate.length > 0) return candidate
-  }
-  return undefined
-}
-
-/**
- * Resolve the organization/project scope required by the git and filesystem
- * APIs. A key that carries its own scope is introspected and that scope wins:
- * a stale TENSORLAKE_PROJECT_ID left in the shell would otherwise make every
- * call fail with an opaque 401. Env vars are the answer only for keys that
- * carry no scope (PATs), or when introspection cannot be reached.
- */
-async function resolveScope(apiKey: string): Promise<Scope> {
-  const envOrg = process.env.TENSORLAKE_ORGANIZATION_ID
-  const envProj = process.env.TENSORLAKE_PROJECT_ID
-  const envScope = envOrg && envProj ? { organizationId: envOrg, projectId: envProj } : undefined
-  if (cachedScope && cachedScope.apiKey === apiKey) return cachedScope.scope
-
-  const client = CloudClient.forCloud({ apiKey, ...(apiUrl() ? { apiUrl: apiUrl() } : {}) })
-  try {
-    let intro: Record<string, unknown>
-    try {
-      intro = (await client.introspectApiKey()) as Record<string, unknown>
-    } catch (err) {
-      // Unreachable or unintrospectable key: env vars are all that is left.
-      if (envScope) {
-        logger.warn(`Could not introspect the API key (${err}); using TENSORLAKE_ORGANIZATION_ID/TENSORLAKE_PROJECT_ID.`)
-        cachedScope = { apiKey, scope: envScope }
-        return envScope
-      }
-      throw err
-    }
-    const keyOrg =
-      pickId(intro, ['organizationId', 'organization_id']) ??
-      pickId(intro.organization, ['id', 'organizationId', 'organization_id'])
-    const keyProj =
-      pickId(intro, ['projectId', 'project_id']) ??
-      pickId(intro.project, ['id', 'projectId', 'project_id'])
-    const organizationId = keyOrg ?? envOrg
-    const projectId = keyProj ?? envProj
-    if (!organizationId || !projectId) {
-      throw new Error(
-        'Could not resolve organization/project from the API key. Set TENSORLAKE_ORGANIZATION_ID and TENSORLAKE_PROJECT_ID.',
-      )
-    }
-    if (envScope && (envScope.organizationId !== organizationId || envScope.projectId !== projectId)) {
-      logger.warn(
-        `TENSORLAKE_ORGANIZATION_ID/TENSORLAKE_PROJECT_ID (${envScope.organizationId}/${envScope.projectId}) do not match the API key's own scope (${organizationId}/${projectId}); using the key's scope. Unset those variables to silence this.`,
-      )
-    }
-    cachedScope = { apiKey, scope: { organizationId, projectId } }
-    return cachedScope.scope
-  } finally {
-    client.close()
-  }
-}
-
-async function cloudOptions(apiKey: string) {
-  const scope = await resolveScope(apiKey)
+// Ingress derives the organization/project scope from the API key itself
+// (SDK >= 0.5.114), so no scope lookup or env-var fallback is needed here.
+function cloudOptions(apiKey: string) {
   return {
     apiKey,
     ...(apiUrl() ? { apiUrl: apiUrl() } : {}),
-    ...scope,
   }
 }
 
@@ -379,7 +311,7 @@ async function syncRepoContainsLocalHead(
     'fetch',
     '--quiet',
     '--no-write-fetch-head',
-    repos.url(repo),
+    await repos.url(repo),
     `+refs/heads/${branch}:${SYNC_REPO_CHECK_REF}`,
   ])
   try {
@@ -400,7 +332,7 @@ async function syncRepoContainsLocalHead(
 async function pushRealHistory(repos: RepositoryClient, repo: string, worktree: string, branch: string): Promise<void> {
   const push = async () => {
     const cred = await repos.credential(repo)
-    await localGit(worktree, ['-c', gitAuthConfig(cred), 'push', '--quiet', repos.url(repo), `HEAD:refs/heads/${branch}`])
+    await localGit(worktree, ['-c', gitAuthConfig(cred), 'push', '--quiet', await repos.url(repo), `HEAD:refs/heads/${branch}`])
   }
   try {
     await push()
@@ -555,7 +487,7 @@ export async function syncGitProject(
   projectId: string,
   destDir: string,
 ): Promise<'synced' | 'diverged'> {
-  const repos = RepositoryClient.forCloud(await cloudOptions(apiKey))
+  const repos = RepositoryClient.forCloud(cloudOptions(apiKey))
   try {
     const repo = syncResourceName(projectId)
     const branch = await resolveSyncBranch(worktree)
@@ -587,7 +519,7 @@ export async function syncGitProject(
       })
     }
 
-    const url = repos.url(repo)
+    const url = await repos.url(repo)
     const credLine = await credentialLine(repos, repo)
 
     // Re-syncs only fast-forward: a sandbox clone with its own commits or
@@ -643,7 +575,7 @@ export async function syncGitProject(
 // https://user:token@host format.
 async function credentialLine(repos: RepositoryClient, repo: string): Promise<string> {
   const cred = await repos.credential(repo)
-  const parsed = new URL(repos.url(repo))
+  const parsed = new URL(await repos.url(repo))
   return `${parsed.protocol}//${encodeURIComponent(cred.gitUsername)}:${encodeURIComponent(cred.token)}@${parsed.host}`
 }
 
@@ -661,7 +593,7 @@ export async function refreshSandboxGitCredential(
   sandboxId: string,
   projectId: string,
 ): Promise<void> {
-  const repos = RepositoryClient.forCloud(await cloudOptions(apiKey))
+  const repos = RepositoryClient.forCloud(cloudOptions(apiKey))
   try {
     const credLine = await credentialLine(repos, syncResourceName(projectId))
     const result = await client.executeCommand(
@@ -714,7 +646,7 @@ export async function syncBackFromSyncRepo(
 ): Promise<SyncBackReport> {
   const branch = await resolveSyncBranch(worktree)
   const repo = syncResourceName(projectId)
-  const repos = RepositoryClient.forCloud(await cloudOptions(apiKey))
+  const repos = RepositoryClient.forCloud(cloudOptions(apiKey))
   try {
     const cred = await repos.credential(repo)
     // --prune drops tracking refs for branches deleted (or recreated) on the
@@ -727,7 +659,7 @@ export async function syncBackFromSyncRepo(
       '--quiet',
       '--no-write-fetch-head',
       '--prune',
-      repos.url(repo),
+      await repos.url(repo),
       '+refs/heads/*:refs/remotes/tensorlake/*',
       `+${WIP_REF_PREFIX}*:${WIP_REF_PREFIX}*`,
     ])
@@ -923,7 +855,7 @@ export async function ensureVolumeWithProject(
   manifestDir: string,
 ): Promise<FileSystemMount> {
   const name = syncResourceName(projectId)
-  const options = await cloudOptions(apiKey)
+  const options = cloudOptions(apiKey)
   const fsClient = new FilesystemClient(options)
   let fs
   try {
@@ -1025,7 +957,7 @@ export async function syncBackFromVolume(
   const name = syncResourceName(projectId)
   const manifestPath = syncManifestPath(manifestDir, name)
   const manifest = readVolumeManifest(manifestPath)
-  const fsClient = new FilesystemClient(await cloudOptions(apiKey))
+  const fsClient = new FilesystemClient(cloudOptions(apiKey))
   let fs
   try {
     fs = await fsClient.get(name)
@@ -1146,7 +1078,7 @@ function sha1File(path: string): string {
  * is retried on the next turn.
  */
 async function assertFileSystemExists(apiKey: string, name: string): Promise<void> {
-  const fsClient = new FilesystemClient(await cloudOptions(apiKey))
+  const fsClient = new FilesystemClient(cloudOptions(apiKey))
   try {
     await fsClient.get(name)
   } catch (err: any) {

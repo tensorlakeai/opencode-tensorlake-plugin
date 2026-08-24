@@ -155,7 +155,7 @@ opencode auth login
 
 Select **Tensorlake** and paste a project API key (starts with `tl_apiKey_`). The key is stored in OpenCode's credential store next to your other provider credentials. If the key is wrong, the first tool call shows an error toast that tells you to log in again.
 
-**CI / automation:** set `TENSORLAKE_API_KEY` instead. The environment variable wins over the stored key. Personal Access Tokens work only through this path and also require `TENSORLAKE_ORGANIZATION_ID` and `TENSORLAKE_PROJECT_ID`; prefer project API keys.
+**CI / automation:** set `TENSORLAKE_API_KEY` instead. The environment variable wins over the stored key. Use a project API key — the key itself selects the organization and project. Personal Access Tokens are not supported.
 
 ## Configuration
 
@@ -164,8 +164,6 @@ All settings are optional environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `TENSORLAKE_API_KEY` | — | Overrides the key stored by `opencode auth login`. For CI/automation. |
-| `TENSORLAKE_ORGANIZATION_ID` | — | Required only for Personal Access Tokens. A project key carries its own scope. |
-| `TENSORLAKE_PROJECT_ID` | — | Required only for Personal Access Tokens. |
 | `TENSORLAKE_IMAGE` | server default | Container image for new sandboxes. |
 | `TENSORLAKE_CPUS` | `2` | vCPUs per sandbox. |
 | `TENSORLAKE_MEMORY_MB` | `4096` | RAM in MB. |

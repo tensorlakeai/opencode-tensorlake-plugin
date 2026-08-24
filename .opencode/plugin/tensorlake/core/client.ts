@@ -1,7 +1,6 @@
 import { RemoteAPIError, Sandbox, SandboxConnectionError, SandboxNotFoundError } from 'tensorlake'
 import type { FileSystemMount } from 'tensorlake'
 import { execFileSync } from 'child_process'
-import { PROJECT_KEY_PREFIX } from './credentials.js'
 import { logger } from './logger.js'
 
 const MANAGEMENT_API = process.env.TENSORLAKE_API_URL ?? 'https://api.tensorlake.ai'
@@ -67,31 +66,10 @@ export class TensorlakeClient {
     return this.resolveKey() ?? ''
   }
 
-  private warnedProjectKeyScopeOverride = false
-
+  // Ingress derives the organization/project scope from the API key itself
+  // (SDK >= 0.5.114); explicit scope options are no longer forwarded.
   private clientOptions() {
-    const apiKey = this.getApiKey()
-    const organizationId = process.env.TENSORLAKE_ORGANIZATION_ID
-    const projectId = process.env.TENSORLAKE_PROJECT_ID
-    // A project API key carries its own org/project scope. Forwarding env IDs
-    // alongside it could point requests at a different project than the key
-    // authorizes, so the key's scope wins and the variables are ignored.
-    if (apiKey.startsWith(PROJECT_KEY_PREFIX) && (organizationId || projectId)) {
-      if (!this.warnedProjectKeyScopeOverride) {
-        this.warnedProjectKeyScopeOverride = true
-        logger.warn(
-          'TENSORLAKE_ORGANIZATION_ID/TENSORLAKE_PROJECT_ID are set, but the API key is a project key ' +
-            `(${PROJECT_KEY_PREFIX}...) that carries its own scope; ignoring the environment variables.`,
-        )
-      }
-      return { apiKey, apiUrl: MANAGEMENT_API }
-    }
-    return {
-      apiKey,
-      apiUrl: MANAGEMENT_API,
-      ...(organizationId ? { organizationId } : {}),
-      ...(projectId ? { projectId } : {}),
-    }
+    return { apiKey: this.getApiKey(), apiUrl: MANAGEMENT_API }
   }
 
   private connectSandbox(sandboxId: string): Promise<Sandbox> {
