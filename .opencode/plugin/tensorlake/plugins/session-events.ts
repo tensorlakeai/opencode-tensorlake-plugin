@@ -23,7 +23,7 @@ export async function eventHandlers(ctx: PluginInput, sessionManager: Tensorlake
     } else if (event.type === EVENT_TYPE_SESSION_DELETED) {
       const sessionId = (event as EventSessionDeleted).properties.info.id
       try {
-        await sessionManager.deleteSandbox(sessionId, projectId)
+        await sessionManager.deleteSandbox(sessionId, projectId, worktree)
         toast.show({ title: 'Session deleted', message: 'Sandbox deleted successfully.', variant: 'success' })
       } catch (err: any) {
         logger.error(`Failed to delete sandbox: ${err}`)

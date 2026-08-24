@@ -49,8 +49,13 @@ export class TensorlakeSessionManager {
   // When the local-change fingerprint was last computed per sandbox — the check is throttled
   private readonly resyncCheckedAt = new Map<string, number>()
   private static readonly RESYNC_CHECK_INTERVAL_MS = 15_000
-  // In-flight sync-back per worktree — session.idle can fire faster than a fetch completes
+  // In-flight or queued sync-back per worktree+sandbox — session.idle can fire
+  // faster than a fetch completes; keying by sandbox keeps one session's idle
+  // from swallowing another sandbox's sync-back
   private readonly syncBackInflight = new Map<string, Promise<SyncBackReport | VolumeSyncBack | undefined>>()
+  // Tail of the sync-back chain per worktree — host git operations (fetch,
+  // merge, wip prune) on one local repo must never run concurrently
+  private readonly syncBackTail = new Map<string, Promise<unknown>>()
   // Last failed sync-back per worktree — retried after a cooldown instead of on every idle
   private readonly syncBackFailedAt = new Map<string, number>()
   // Sync repo commit already reported as "staged, not merged" per worktree — suppresses repeat toasts
@@ -59,6 +64,9 @@ export class TensorlakeSessionManager {
   private readonly lastWipOid = new Map<string, string>()
   // Keys already checked for project scope — the warning fires once per key
   private readonly warnedKeys = new Set<string>()
+  // Sessions whose sandbox was (or is being) deleted — a late tool call must
+  // fail instead of silently creating a fresh sandbox for a dead session
+  private readonly deleting = new Set<string>()
   // When each sandbox's git credential was last written — tokens expire in ~1h
   private readonly credRefreshedAt = new Map<string, number>()
   // Post-sync setup command (from plugin options / env); undefined = none
@@ -433,14 +441,29 @@ export class TensorlakeSessionManager {
     if (mode !== 'git' && mode !== 'volume') return
     const failedAt = this.syncBackFailedAt.get(worktree)
     if (failedAt !== undefined && Date.now() - failedAt < TensorlakeSessionManager.SYNC_RETRY_COOLDOWN_MS) return
-    const existing = this.syncBackInflight.get(worktree)
+    const sandboxId = cached.sandboxId
+    // Dedup per sandbox: a second idle for the SAME sandbox joins its pending
+    // run. A different sandbox of the same worktree gets its own run instead —
+    // returning the first sandbox's promise would silently skip its wip capture.
+    const key = `${worktree}\0${sandboxId}`
+    const existing = this.syncBackInflight.get(key)
     if (existing) return existing
-    const run = (
-      mode === 'git'
-        ? this._syncBack(worktree, projectId, cached.sandboxId)
-        : this._syncBackVolume(worktree, projectId, cached.sandboxId)
-    ).finally(() => this.syncBackInflight.delete(worktree))
-    this.syncBackInflight.set(worktree, run)
+    // Serialize per worktree: each run chains behind the current tail so two
+    // sandboxes never fetch/merge into the same local repo at once.
+    const prev = this.syncBackTail.get(worktree) ?? Promise.resolve()
+    const run = prev
+      .catch(() => undefined)
+      .then((): Promise<SyncBackReport | VolumeSyncBack | undefined> =>
+        mode === 'git'
+          ? this._syncBack(worktree, projectId, sandboxId)
+          : this._syncBackVolume(worktree, projectId, sandboxId),
+      )
+      .finally(() => {
+        this.syncBackInflight.delete(key)
+        if (this.syncBackTail.get(worktree) === run) this.syncBackTail.delete(worktree)
+      })
+    this.syncBackInflight.set(key, run)
+    this.syncBackTail.set(worktree, run)
     return run
   }
 
@@ -606,6 +629,9 @@ export class TensorlakeSessionManager {
     worktree: string,
     pluginCtx?: PluginInput,
   ): Promise<{ sandboxId: string }> {
+    if (this.deleting.has(sessionId)) {
+      return Promise.reject(new Error(`Session ${sessionId} was deleted; its sandbox is gone and will not be recreated.`))
+    }
     const existing = this.inflight.get(sessionId)
     if (existing) return existing
     const promise = this._getSandbox(sessionId, projectId, worktree, pluginCtx)
@@ -689,44 +715,38 @@ export class TensorlakeSessionManager {
       }
     }
 
-    // Check persistent storage — first for this session, then for any session in the project
+    // Check persistent storage for this session only. Never adopt another
+    // session's sandbox: sessions must stay isolated, and deleting either
+    // session would tear down the shared sandbox.
     const projectData = this.loadProjectData(projectId)
-    const candidateSessions = projectData
-      ? [
-          ...(projectData.sessions[sessionId] ? [[sessionId, projectData.sessions[sessionId]] as const] : []),
-          ...Object.entries(projectData.sessions)
-            .filter(([id]) => id !== sessionId)
-            .sort(([, a], [, b]) => b.lastAccessed - a.lastAccessed),
-        ]
-      : []
+    const stored = projectData?.sessions[sessionId]
 
-    for (const [storedSessionId, stored] of candidateSessions) {
-      logger.info(`Trying sandbox ${stored.sandboxId} from session ${storedSessionId}`)
+    if (stored) {
+      logger.info(`Trying sandbox ${stored.sandboxId} from session ${sessionId}`)
       try {
         const info = await this.client.getSandbox(stored.sandboxId)
         // 'timeout' is terminal like 'terminated' — waiting on it never ends in 'running'
         if (info.status === 'terminated' || info.status === 'timeout') {
-          this.removeSession(projectId, storedSessionId)
-          continue
+          this.removeSession(projectId, sessionId)
+        } else {
+          if (info.status === 'suspended' || info.status === 'suspending') {
+            logger.info(`Resuming sandbox ${stored.sandboxId} (was ${info.status})`)
+            if (info.status === 'suspending') await this.client.waitForSuspended(stored.sandboxId)
+            // resumeSandbox blocks until the sandbox is running again
+            await this.client.resumeSandbox(stored.sandboxId)
+          } else if (info.status !== 'running') {
+            await this.client.waitForRunning(stored.sandboxId)
+          }
+          const entry = { sandboxId: stored.sandboxId }
+          this.cache.set(sessionId, entry)
+          this.updateSession(projectId, worktree, sessionId, stored.sandboxId)
+          toast.show({ title: 'Sandbox connected', message: 'Connected to existing sandbox.', variant: 'info' })
+          await this.ensureProjectAvailable(stored.sandboxId, projectId, worktree)
+          return entry
         }
-        if (info.status === 'suspended' || info.status === 'suspending') {
-          logger.info(`Resuming sandbox ${stored.sandboxId} (was ${info.status})`)
-          if (info.status === 'suspending') await this.client.waitForSuspended(stored.sandboxId)
-          // resumeSandbox blocks until the sandbox is running again
-          await this.client.resumeSandbox(stored.sandboxId)
-        } else if (info.status !== 'running') {
-          await this.client.waitForRunning(stored.sandboxId)
-        }
-        const entry = { sandboxId: stored.sandboxId }
-        this.cache.set(sessionId, entry)
-        this.updateSession(projectId, worktree, sessionId, stored.sandboxId)
-        const reused = storedSessionId !== sessionId
-        toast.show({ title: 'Sandbox connected', message: reused ? 'Reusing sandbox from previous session.' : 'Connected to existing sandbox.', variant: 'info' })
-        await this.ensureProjectAvailable(stored.sandboxId, projectId, worktree)
-        return entry
       } catch (err) {
         logger.warn(`Failed to connect to sandbox ${stored.sandboxId}: ${err}`)
-        this.removeSession(projectId, storedSessionId)
+        this.removeSession(projectId, sessionId)
       }
     }
 
@@ -767,7 +787,14 @@ export class TensorlakeSessionManager {
     }
   }
 
-  async deleteSandbox(sessionId: string, projectId: string): Promise<void> {
+  async deleteSandbox(sessionId: string, projectId: string, worktree?: string): Promise<void> {
+    // Block new tool calls from resurrecting the session first, then wait for
+    // an in-flight getSandbox: a delete that raced sandbox creation would
+    // otherwise see no sandboxId, report success, and orphan the new sandbox.
+    this.deleting.add(sessionId)
+    const inflight = this.inflight.get(sessionId)
+    if (inflight) await inflight.catch(() => undefined)
+
     const cached = this.cache.get(sessionId)
     const projectData = this.loadProjectData(projectId)
     const stored = projectData?.sessions[sessionId]
@@ -778,10 +805,53 @@ export class TensorlakeSessionManager {
       return
     }
 
-    logger.info(`Deleting sandbox ${sandboxId} for session ${sessionId}`)
-    await this.client.deleteSandbox(sandboxId)
+    // Data persisted before sessions were isolated can alias one sandbox to
+    // several sessions. Only tear down the sandbox when no other session
+    // still references it; otherwise just detach this session.
+    const sharedWith = Object.entries(projectData?.sessions ?? {}).filter(
+      ([id, s]) => id !== sessionId && s.sandboxId === sandboxId,
+    )
+    if (sharedWith.length > 0) {
+      this.cache.delete(sessionId)
+      this.removeSession(projectId, sessionId)
+      logger.warn(`Sandbox ${sandboxId} is still used by ${sharedWith.length} other session(s); detached session ${sessionId} without deleting it`)
+      return
+    }
+
+    // Final sync-back before the sandbox (and its only copy of uncommitted
+    // agent work) is destroyed. Best-effort: a failure is logged and never
+    // blocks the deletion the user asked for.
+    if (worktree) {
+      try {
+        // Let an in-flight inbound sync settle — it holds locks the volume
+        // sync-back skips on — and lift the retry cooldown: this is the last
+        // chance to pull work home.
+        const syncing = this.syncInflight.get(sandboxId)
+        if (syncing) await syncing
+        this.syncBackFailedAt.delete(worktree)
+        // syncBack reads the session's cache entry; restore it if the sandbox
+        // was only known from persistent storage.
+        if (!this.cache.has(sessionId)) this.cache.set(sessionId, { sandboxId })
+        await this.syncBack(sessionId, projectId, worktree)
+      } catch (err: any) {
+        logger.warn(`Final sync-back before deleting sandbox ${sandboxId} failed: ${err?.message ?? err}`)
+      }
+    }
+
     this.cache.delete(sessionId)
     this.removeSession(projectId, sessionId)
+
+    logger.info(`Deleting sandbox ${sandboxId} for session ${sessionId}`)
+    await this.client.deleteSandbox(sandboxId)
     logger.info(`Sandbox ${sandboxId} deleted`)
+
+    // Drop per-sandbox state — the id never comes back.
+    this.synced.delete(sandboxId)
+    this.hasProjectDir.delete(sandboxId)
+    this.syncFailedAt.delete(sandboxId)
+    this.syncedFingerprint.delete(sandboxId)
+    this.resyncCheckedAt.delete(sandboxId)
+    this.credRefreshedAt.delete(sandboxId)
+    this.setupChecked.delete(sandboxId)
   }
 }
