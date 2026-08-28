@@ -1,9 +1,11 @@
 import type { PluginInput } from '@opencode-ai/plugin'
-import { createTensorLakeTools } from '../tools.js'
+import { createTensorlakeTools } from '../tools.js'
 import { logger } from '../core/logger.js'
-import type { TensorLakeSessionManager } from '../core/session-manager.js'
+import { resolveProjectContext } from '../core/project-context.js'
+import type { TensorlakeSessionManager } from '../core/session-manager.js'
 
-export async function customTools(ctx: PluginInput, sessionManager: TensorLakeSessionManager) {
-  logger.info('OpenCode started with TensorLake plugin')
-  return createTensorLakeTools(sessionManager, ctx.project.id, ctx.project.worktree, ctx)
+export async function customTools(ctx: PluginInput, sessionManager: TensorlakeSessionManager) {
+  const { projectId, worktree } = resolveProjectContext(ctx)
+  logger.info(`OpenCode started with Tensorlake plugin (project=${projectId}, worktree=${worktree || '(none)'})`)
+  return createTensorlakeTools(sessionManager, projectId, worktree, ctx)
 }

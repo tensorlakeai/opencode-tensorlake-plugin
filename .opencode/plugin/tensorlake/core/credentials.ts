@@ -61,15 +61,16 @@ export function resolveApiKey(): string | undefined {
 /**
  * OpenCode's built-in API-key prompt cannot validate the key at login (the
  * plugin never sees the masked value), so keys are checked here on first use.
- * A non-project key still works when its scope is supplied via env vars, so
+ * The SDK (>= 0.5.114) accepts only project API keys — ingress derives the
+ * project scope from the key, and Personal Access Tokens are not supported —
+ * but the key may still be valid in ways this prefix check cannot see, so
  * this is a warning, not a hard failure.
  */
 export function projectKeyWarning(apiKey: string): string | undefined {
   if (apiKey.startsWith(PROJECT_KEY_PREFIX)) return undefined
-  if (process.env.TENSORLAKE_ORGANIZATION_ID && process.env.TENSORLAKE_PROJECT_ID) return undefined
   return (
     `The stored key is not a project API key (${PROJECT_KEY_PREFIX}...). ` +
     'Sandbox calls may fail. Re-run `opencode auth login` with a project API key from ' +
-    'https://cloud.tensorlake.ai (Project → API Keys), or set TENSORLAKE_ORGANIZATION_ID and TENSORLAKE_PROJECT_ID.'
+    'https://cloud.tensorlake.ai (Project → API Keys).'
   )
 }

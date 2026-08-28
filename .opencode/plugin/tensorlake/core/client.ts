@@ -1,9 +1,14 @@
 import { RemoteAPIError, Sandbox, SandboxConnectionError, SandboxNotFoundError } from 'tensorlake'
+import type { FileSystemMount } from 'tensorlake'
 import { execFileSync } from 'child_process'
-import { PROJECT_KEY_PREFIX } from './credentials.js'
 import { logger } from './logger.js'
+import { shellQuote } from './shell.js'
 
 const MANAGEMENT_API = process.env.TENSORLAKE_API_URL ?? 'https://api.tensorlake.ai'
+
+/** Default bound on one sandbox command. Waits that must outlast a running
+ * tool call (e.g. deletion draining active leases) size themselves off this. */
+export const COMMAND_TIMEOUT_MS = 120_000
 
 export type SandboxInfo = {
   sandbox_id: string
@@ -35,7 +40,7 @@ type HandleEntry = {
   sandbox?: Sandbox
 }
 
-export class TensorLakeClient {
+export class TensorlakeClient {
   // Connected handles keyed by sandboxId, so repeated operations reuse the
   // resolved proxy routing instead of re-resolving on every call. The pending
   // connect promise is cached (not the resolved handle) so concurrent calls
@@ -45,6 +50,20 @@ export class TensorLakeClient {
   // replaced when `opencode auth login` stores a new one — even if the old
   // key is still valid and would never produce a 401.
   private readonly handles = new Map<string, HandleEntry>()
+
+  // When each sandbox last started or settled a proxy-routed operation.
+  // Deletion watches this to tell a tool call that is still making progress
+  // (a chain of bounded ops) from a lease whose release leaked.
+  private readonly activityAt = new Map<string, number>()
+
+  private touch(sandboxId: string): void {
+    this.activityAt.set(sandboxId, Date.now())
+  }
+
+  /** When the sandbox last started or settled an operation, if ever. */
+  lastActivityAt(sandboxId: string): number | undefined {
+    return this.activityAt.get(sandboxId)
+  }
 
   // Credentials are resolved lazily on every use so a key added via
   // `opencode auth login` after startup is picked up without a restart.
@@ -58,31 +77,10 @@ export class TensorLakeClient {
     return this.resolveKey() ?? ''
   }
 
-  private warnedProjectKeyScopeOverride = false
-
+  // Ingress derives the organization/project scope from the API key itself
+  // (SDK >= 0.5.114); explicit scope options are no longer forwarded.
   private clientOptions() {
-    const apiKey = this.getApiKey()
-    const organizationId = process.env.TENSORLAKE_ORGANIZATION_ID
-    const projectId = process.env.TENSORLAKE_PROJECT_ID
-    // A project API key carries its own org/project scope. Forwarding env IDs
-    // alongside it could point requests at a different project than the key
-    // authorizes, so the key's scope wins and the variables are ignored.
-    if (apiKey.startsWith(PROJECT_KEY_PREFIX) && (organizationId || projectId)) {
-      if (!this.warnedProjectKeyScopeOverride) {
-        this.warnedProjectKeyScopeOverride = true
-        logger.warn(
-          'TENSORLAKE_ORGANIZATION_ID/TENSORLAKE_PROJECT_ID are set, but the API key is a project key ' +
-            `(${PROJECT_KEY_PREFIX}...) that carries its own scope; ignoring the environment variables.`,
-        )
-      }
-      return { apiKey, apiUrl: MANAGEMENT_API }
-    }
-    return {
-      apiKey,
-      apiUrl: MANAGEMENT_API,
-      ...(organizationId ? { organizationId } : {}),
-      ...(projectId ? { projectId } : {}),
-    }
+    return { apiKey: this.getApiKey(), apiUrl: MANAGEMENT_API }
   }
 
   private connectSandbox(sandboxId: string): Promise<Sandbox> {
@@ -140,15 +138,20 @@ export class TensorLakeClient {
     op: (sandbox: Sandbox) => Promise<T>,
     opts: { retry: boolean } = { retry: true },
   ): Promise<T> {
-    const sandbox = await this.connectSandbox(sandboxId)
+    this.touch(sandboxId)
     try {
-      return await op(sandbox)
-    } catch (err: unknown) {
-      if (!this.isStaleHandleError(err)) throw err
-      this.dropHandle(sandboxId, sandbox)
-      if (!opts.retry) throw err
-      logger.warn(`Sandbox ${sandboxId} call failed (${(err as Error)?.message ?? err}); reconnecting and retrying once`)
-      return op(await this.connectSandbox(sandboxId))
+      const sandbox = await this.connectSandbox(sandboxId)
+      try {
+        return await op(sandbox)
+      } catch (err: unknown) {
+        if (!this.isStaleHandleError(err)) throw err
+        this.dropHandle(sandboxId, sandbox)
+        if (!opts.retry) throw err
+        logger.warn(`Sandbox ${sandboxId} call failed (${(err as Error)?.message ?? err}); reconnecting and retrying once`)
+        return await op(await this.connectSandbox(sandboxId))
+      }
+    } finally {
+      this.touch(sandboxId)
     }
   }
 
@@ -167,7 +170,7 @@ export class TensorLakeClient {
       })
   }
 
-  async createSandbox(opts: { image?: string; name?: string; timeoutSecs?: number } = {}): Promise<CreateSandboxResponse> {
+  async createSandbox(opts: { image?: string; name?: string; timeoutSecs?: number; fileSystems?: FileSystemMount[] } = {}): Promise<CreateSandboxResponse> {
     const cpus = parseFloat(process.env.TENSORLAKE_CPUS ?? '2')
     const memoryMb = parseInt(process.env.TENSORLAKE_MEMORY_MB ?? '4096', 10)
     const ephemeralDiskMb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
@@ -181,10 +184,27 @@ export class TensorLakeClient {
       diskMb: ephemeralDiskMb,
       ...(opts.name ? { name: opts.name } : {}),
       ...(opts.timeoutSecs ? { timeoutSecs: opts.timeoutSecs } : {}),
+      ...(opts.fileSystems?.length ? { fileSystems: opts.fileSystems } : {}),
       ...this.clientOptions(),
     })
     this.handles.set(sandbox.sandboxId, { apiKey: this.getApiKey(), promise: Promise.resolve(sandbox), sandbox })
     return { sandbox_id: sandbox.sandboxId, status: 'running' }
+  }
+
+  async listSandboxFileSystems(sandboxId: string): Promise<FileSystemMount[]> {
+    const info = await this.withSandbox(sandboxId, (sandbox) => sandbox.info())
+    return info.fileSystems ?? []
+  }
+
+  async attachFileSystem(sandboxId: string, fileSystemId: string, mountPath: string): Promise<void> {
+    // retry: false — a retried attach after a mid-flight failure could double-attach
+    await this.withSandbox(sandboxId, (sandbox) => sandbox.attachFileSystem(fileSystemId, mountPath), { retry: false })
+  }
+
+  async detachFileSystem(sandboxId: string, mountPath: string): Promise<void> {
+    // retry: false — a retry after a mid-flight success would fail on the
+    // already-detached path and mask the real outcome
+    await this.withSandbox(sandboxId, (sandbox) => sandbox.detachFileSystem(mountPath), { retry: false })
   }
 
   async getSandbox(sandboxId: string): Promise<SandboxInfo> {
@@ -210,6 +230,7 @@ export class TensorLakeClient {
       throw err
     } finally {
       this.dropHandle(sandboxId)
+      this.activityAt.delete(sandboxId)
     }
   }
 
@@ -260,7 +281,10 @@ export class TensorLakeClient {
     while (Date.now() < deadline) {
       const info = await this.getSandbox(sandboxId)
       if (info.status === 'running') return
-      if (info.status === 'terminated') throw new Error(`Sandbox ${sandboxId} was terminated`)
+      // 'timeout' is terminal like 'terminated' — fail fast instead of polling to the deadline
+      if (info.status === 'terminated' || info.status === 'timeout') {
+        throw new Error(`Sandbox ${sandboxId} is ${info.status}`)
+      }
       await new Promise((r) => setTimeout(r, 500))
     }
     throw new Error(`Sandbox ${sandboxId} did not become running within ${timeoutMs}ms`)
@@ -270,7 +294,7 @@ export class TensorLakeClient {
     sandboxId: string,
     command: string,
     workingDir = '/tmp/workspace',
-    timeoutMs = 120_000,
+    timeoutMs = COMMAND_TIMEOUT_MS,
   ): Promise<ProcessResult> {
     const result = await this.withSandbox(
       sandboxId,
@@ -292,6 +316,23 @@ export class TensorLakeClient {
   async readFile(sandboxId: string, path: string): Promise<Buffer> {
     const data = await this.withSandbox(sandboxId, (sandbox) => sandbox.readFile(path))
     return Buffer.from(data)
+  }
+
+  /**
+   * Reads a whole file, but checks its size in the sandbox first. Editing tools
+   * need the complete text, so the only protection against a huge or binary
+   * file exhausting this process is to refuse it before the transfer starts.
+   */
+  async readFileBounded(sandboxId: string, path: string, maxBytes: number): Promise<Buffer> {
+    const probe = await this.executeCommand(sandboxId, `wc -c < ${shellQuote(path)} 2>/dev/null`, '/', 15_000)
+    const size = Number(probe.stdout.trim())
+    if (Number.isFinite(size) && size > maxBytes) {
+      throw new Error(
+        `${path} is ${size} bytes, over the ${maxBytes}-byte edit limit. ` +
+          'Use the read tool with offset and limit, or edit it with a bash command.',
+      )
+    }
+    return this.readFile(sandboxId, path)
   }
 
   async writeFile(sandboxId: string, path: string, content: Buffer): Promise<void> {

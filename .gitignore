@@ -32,3 +32,8 @@ Thumbs.db
 yarn.lock
 pnpm-lock.yaml
 .tensorlake/
+
+# Agent tooling (local only)
+.agents/
+.claude/
+skills-lock.json
