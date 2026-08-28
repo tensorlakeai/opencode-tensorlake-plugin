@@ -44,22 +44,31 @@ opencode-tensorlake-plugin/
             ├── core/
             │   ├── client.ts                 # Tensorlake SDK client wrapper
             │   ├── credentials.ts            # API key resolution (auth.json + env)
+            │   ├── filesystem.ts             # optional persistent filesystem attach
+            │   ├── git-bootstrap.ts          # optional hosted git repo credentials
+            │   ├── glob-match.ts             # glob pattern to RegExp compiler
             │   ├── logger.ts                 # file-based logger with rotation
+            │   ├── project-context.ts        # resolves the local project identity
             │   ├── session-manager.ts        # sandbox lifecycle management
+            │   ├── session-store.ts          # persistent session -> sandbox mapping
+            │   ├── session-tree.ts           # maps subagent sessions to their root
+            │   ├── shell.ts                  # shell quoting helper
             │   ├── toast.ts                  # TUI toast queue
             │   └── types.ts                  # shared type definitions
             ├── tools/
+            │   ├── apply-patch.ts
             │   ├── bash.ts
             │   ├── read.ts
             │   ├── write.ts
             │   ├── edit.ts
+            │   ├── multiedit.ts
             │   ├── ls.ts
             │   ├── glob.ts
             │   └── grep.ts
             └── plugins/
                 ├── auth.ts                   # registers Tensorlake in opencode auth login
                 ├── custom-tools.ts           # wires tools into plugin return value
-                ├── session-events.ts         # handles session.deleted event
+                ├── session-events.ts         # handles session created/deleted events
                 └── system-transform.ts       # injects sandbox context into system prompt
 ```
 
@@ -72,7 +81,25 @@ npm run build
 
 The build emits to `dist/` with declaration files. `tsconfig.lib.json` sets `rootDir` to `.opencode/plugin`, so the output mirrors that structure. The `main` field in `package.json` points to `dist/index.js`.
 
+## Unit tests
+
+```bash
+npm test
+```
+
+Runs `test/*.test.ts` with the Node test runner (via `tsx`). No Tensorlake key is needed. The tests cover the logic that does not need a sandbox:
+
+- `apply-patch` — patch parsing, hunk matching, and the tool's all-or-nothing commit. The tool test runs the real shell scripts in a temp directory and checks that a failed step restores every file.
+- `glob-match` — glob to RegExp, and the literal prefix used to narrow the search.
+- `session-tree` — subagent to root resolution, cached lookups, cycles, failures.
+- `session-store` — atomic writes, quarantine of corrupt files, stale-lock recovery, three processes writing at once.
+- `options` — `filesystem` / `gitRepo` resolution and env precedence; `shellQuote`.
+
+One test waits about 6 s on purpose (a lock held by a live process).
+
 ## Manual tests
+
+Everything below needs a real sandbox and a Tensorlake key. Run it before a release.
 
 ### Auth flow
 
@@ -93,7 +120,7 @@ The build emits to `dist/` with declaration files. `tsconfig.lib.json` sets `roo
    On startup you see one line:
 
    ```
-   [...] [INFO] OpenCode started with TensorLake plugin
+   [...] [INFO] OpenCode started with Tensorlake plugin
    ```
 
    If the file does not exist, the plugin never loaded — see [Plugin not loading](#plugin-not-loading).
@@ -138,6 +165,32 @@ Delete the OpenCode session from the session list. The plugin handles `session.d
 [...] [INFO] Sandbox sandbox-xyz deleted
 ```
 
+### Subagent sandbox sharing
+
+1. In a session with a sandbox, ask the model to use the `task` tool (for example, `Use a subagent task to create /tmp/workspace/from-subagent.txt`).
+2. After the task completes, ask the parent to read the file. It sees the subagent's write — both ran in the same sandbox.
+3. The log shows the subagent session resolved to the root session, and no second `Creating new sandbox` line appears.
+
+### Persistent filesystem
+
+1. Create a filesystem: `tl fs create test-fs`.
+2. Add `{ "filesystem": "test-fs" }` to the plugin options (or export `TENSORLAKE_FILESYSTEM=test-fs`) and restart OpenCode.
+3. Ask the model to write a file in `/tmp/workspace`, then delete the session.
+4. Start a new session and read the file back. It survived the sandbox deletion.
+5. Negative test: set a name that does not exist. The first tool call fails with a **"Filesystem attach failed"** toast, and no command runs against ephemeral storage.
+
+### Hosted git repository
+
+1. Add `{ "gitRepo": "test-repo" }` to the plugin options (or export `TENSORLAKE_GIT_REPO=test-repo`) and restart OpenCode.
+2. Ask the model to clone the repo, commit a file, and push. The system prompt gives it the clone URL; the push uses the scoped credential the plugin stored in the sandbox.
+3. Confirm the commit landed: `tl` or the Tensorlake console shows it, or clone the repo elsewhere.
+4. Confirm isolation: `cat ~/.git-credentials` in the sandbox shows only the Tensorlake host line, never your own credentials.
+
+### Suspend and resume across restart
+
+1. Create a sandbox (run any command), then quit OpenCode (Ctrl+C). The log shows the sandboxes being suspended.
+2. Start OpenCode, open the same session, and run a command. A **"Sandbox resumed"** toast appears and the files from before the restart are still there.
+
 ## Debugging
 
 ### Plugin not loading
@@ -172,7 +225,7 @@ Suspension requires the sandbox to have been **named** at creation time. Sandbox
 
 ## Changing sandbox defaults
 
-The resource env vars (`TENSORLAKE_CPUS`, `TENSORLAKE_MEMORY_MB`, `TENSORLAKE_DISK_MB`, `TENSORLAKE_IMAGE`) are documented in the README. The code defaults live in `TensorLakeClient.createSandbox` in `.opencode/plugin/tensorlake/core/client.ts`:
+The resource env vars (`TENSORLAKE_CPUS`, `TENSORLAKE_MEMORY_MB`, `TENSORLAKE_DISK_MB`, `TENSORLAKE_IMAGE`) are documented in the README. The code defaults live in `TensorlakeClient.createSandbox` in `.opencode/plugin/tensorlake/core/client.ts`:
 
 ```typescript
 const cpus = parseFloat(process.env.TENSORLAKE_CPUS ?? '2')
