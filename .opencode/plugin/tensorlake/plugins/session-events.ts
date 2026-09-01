@@ -9,10 +9,8 @@ import {
 import { toast } from '../core/toast.js'
 import { logger } from '../core/logger.js'
 import type { TensorlakeSessionManager } from '../core/session-manager.js'
-import { resolveProjectContext } from '../core/project-context.js'
 
 export async function eventHandlers(ctx: PluginInput, sessionManager: TensorlakeSessionManager) {
-  const { projectId } = resolveProjectContext(ctx)
   return async (args: any) => {
     const event = args.event
     if (event.type === EVENT_TYPE_SESSION_CREATED) {
@@ -26,9 +24,8 @@ export async function eventHandlers(ctx: PluginInput, sessionManager: Tensorlake
       const sessionId = info.id
       sessionManager.noteSession(sessionId, info.parentID)
       try {
-        const outcome = await sessionManager.deleteSandbox(sessionId, projectId)
-        // 'detached' is a subagent session (or a sandbox another session still
-        // uses) and 'none' never had a sandbox; neither is worth a toast.
+        const outcome = await sessionManager.deleteSandbox(sessionId)
+        // 'detached' is a subagent session and 'none' never had a sandbox; neither is worth a toast.
         if (outcome === 'deleted') {
           toast.show({ title: 'Session deleted', message: 'Sandbox deleted successfully.', variant: 'success' })
         }

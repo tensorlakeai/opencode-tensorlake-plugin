@@ -15,8 +15,6 @@ const MAX_LINE_BYTES = 1024
 
 export const grepTool = (
   sessionManager: TensorlakeSessionManager,
-  projectId: string,
-  worktree: string,
   pluginCtx: PluginInput,
 ) => ({
   description:
@@ -33,8 +31,8 @@ export const grepTool = (
     args: { pattern: string; path?: string; include?: string; limit?: number },
     ctx: ToolContext,
   ) {
-    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
-    const searchPath = args.path ?? sessionManager.projectDir(worktree)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, pluginCtx)
+    const searchPath = args.path ?? sessionManager.projectDir()
     // Clamp as well as validate: a client that skips schema checks still
     // cannot ask for an unbounded result set.
     const limit = Math.min(Math.max(args.limit ?? DEFAULT_LIMIT, 1), MAX_LIMIT)

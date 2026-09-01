@@ -13,8 +13,6 @@ const MAX_SCAN = 20_000
 
 export const globTool = (
   sessionManager: TensorlakeSessionManager,
-  projectId: string,
-  worktree: string,
   pluginCtx: PluginInput,
 ) => ({
   description:
@@ -27,8 +25,8 @@ export const globTool = (
     path: z.string().optional(),
   },
   async execute(args: { pattern: string; path?: string }, ctx: ToolContext) {
-    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
-    const base = (args.path ?? sessionManager.projectDir(worktree)).replace(/\/+$/, '')
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, pluginCtx)
+    const base = (args.path ?? sessionManager.projectDir()).replace(/\/+$/, '')
     const prefix = literalPrefix(args.pattern)
     const root = prefix ? `${base}/${prefix}` : base
 

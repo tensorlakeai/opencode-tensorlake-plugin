@@ -16,8 +16,6 @@ const MAX_EDIT_BYTES = 10 * 1024 * 1024
  */
 export const multiEditTool = (
   sessionManager: TensorlakeSessionManager,
-  projectId: string,
-  worktree: string,
   pluginCtx: PluginInput,
 ) => ({
   description:
@@ -37,7 +35,7 @@ export const multiEditTool = (
       .describe('Edits applied in order, each against the result of the previous one'),
   },
   async execute(args: { filePath: string; edits: EditSpec[] }, ctx: ToolContext) {
-    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, pluginCtx)
     const client = sessionManager.getClient()
     const buffer = await client.readFileBounded(sandboxId, args.filePath, MAX_EDIT_BYTES)
     const original = new TextDecoder().decode(buffer)

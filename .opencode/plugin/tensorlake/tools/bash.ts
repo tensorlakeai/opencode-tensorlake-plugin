@@ -5,8 +5,6 @@ import type { TensorlakeSessionManager } from '../core/session-manager.js'
 
 export const bashTool = (
   sessionManager: TensorlakeSessionManager,
-  projectId: string,
-  worktree: string,
   pluginCtx: PluginInput,
 ) => ({
   description: 'Executes shell commands in a Tensorlake sandbox',
@@ -14,8 +12,8 @@ export const bashTool = (
     command: z.string(),
   },
   async execute(args: { command: string }, ctx: ToolContext) {
-    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
-    const workDir = sessionManager.projectDir(worktree)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, pluginCtx)
+    const workDir = sessionManager.projectDir()
     const result = await sessionManager.getClient().executeCommand(sandboxId, args.command, workDir)
     const output = [result.stdout, result.stderr].filter(Boolean).join('\n')
     return `Exit code: ${result.exitCode}\n${output}`

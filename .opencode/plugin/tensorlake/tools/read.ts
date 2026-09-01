@@ -18,8 +18,6 @@ const NOT_REGULAR = '__TL_NOTFILE__'
 
 export const readTool = (
   sessionManager: TensorlakeSessionManager,
-  projectId: string,
-  worktree: string,
   pluginCtx: PluginInput,
 ) => ({
   description:
@@ -33,7 +31,7 @@ export const readTool = (
     limit: z.number().int().min(1).max(MAX_LIMIT).optional(),
   },
   async execute(args: { filePath: string; offset?: number; limit?: number }, ctx: ToolContext) {
-    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, pluginCtx)
     const offset = args.offset ?? 0
     // Clamp as well as validate: a client that skips schema checks still cannot
     // ask for an unbounded slice.

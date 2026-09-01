@@ -48,9 +48,7 @@ opencode-tensorlake-plugin/
             │   ├── git-bootstrap.ts          # optional hosted git repo credentials
             │   ├── glob-match.ts             # glob pattern to RegExp compiler
             │   ├── logger.ts                 # file-based logger with rotation
-            │   ├── project-context.ts        # resolves the local project identity
-            │   ├── session-manager.ts        # sandbox lifecycle management
-            │   ├── session-store.ts          # persistent session -> sandbox mapping
+            │   ├── session-manager.ts        # binds sessions to sandboxes (Sandbox.getOrCreate)
             │   ├── session-tree.ts           # maps subagent sessions to their root
             │   ├── shell.ts                  # shell quoting helper
             │   ├── toast.ts                  # TUI toast queue
@@ -92,10 +90,8 @@ Runs `test/*.test.ts` with the Node test runner (via `tsx`). No Tensorlake key i
 - `apply-patch` — patch parsing, hunk matching, and the tool's all-or-nothing commit. The tool test runs the real shell scripts in a temp directory and checks that a failed step restores every file.
 - `glob-match` — glob to RegExp, and the literal prefix used to narrow the search.
 - `session-tree` — subagent to root resolution, cached lookups, cycles, failures.
-- `session-store` — atomic writes, quarantine of corrupt files, stale-lock recovery, three processes writing at once.
+- `sandbox-name` — the deterministic sandbox name a session binds to.
 - `options` — `filesystem` / `gitRepo` resolution and env precedence; `shellQuote`.
-
-One test waits about 6 s on purpose (a lock held by a live process).
 
 ## Manual tests
 
@@ -128,8 +124,7 @@ Everything below needs a real sandbox and a Tensorlake key. Run it before a rele
 3. Ask the model to run a command. The first tool call provisions the sandbox; a **"Sandbox created"** toast appears, and the log shows:
 
    ```
-   [...] [INFO] Creating new sandbox for session abc123
-   [...] [INFO] Sandbox created sandbox-xyz in 2300ms
+   [...] [INFO] Sandbox sandbox-xyz (opencode-abc123) created for session abc123 in 2300ms
    ```
 
 ### Bash
@@ -161,15 +156,14 @@ This triggers the `ls` tool, which calls `sandbox.listDirectory()` via the SDK.
 Delete the OpenCode session from the session list. The plugin handles `session.deleted` and terminates the sandbox. Confirm in the log:
 
 ```
-[...] [INFO] Deleting sandbox sandbox-xyz for session abc123
-[...] [INFO] Sandbox sandbox-xyz deleted
+[...] [INFO] Sandbox opencode-abc123 deleted
 ```
 
 ### Subagent sandbox sharing
 
 1. In a session with a sandbox, ask the model to use the `task` tool (for example, `Use a subagent task to create /tmp/workspace/from-subagent.txt`).
 2. After the task completes, ask the parent to read the file. It sees the subagent's write — both ran in the same sandbox.
-3. The log shows the subagent session resolved to the root session, and no second `Creating new sandbox` line appears.
+3. The log shows the subagent session resolved to the root session, and no second `created for session` line appears.
 
 ### Persistent filesystem
 
@@ -219,18 +213,14 @@ service=tool.registry status=started bash   ← plugin override (should appear)
 
 If the second block is absent, the plugin loaded but failed to return its hooks. Check `tensorlake.log` for startup errors.
 
-### Sandbox not suspending on exit
-
-Suspension requires the sandbox to have been **named** at creation time. Sandboxes created before this was implemented cannot be suspended. Delete the old session to trigger cleanup, then create a new session — new sandboxes are always named.
-
 ## Changing sandbox defaults
 
-The resource env vars (`TENSORLAKE_CPUS`, `TENSORLAKE_MEMORY_MB`, `TENSORLAKE_DISK_MB`, `TENSORLAKE_IMAGE`) are documented in the README. The code defaults live in `TensorlakeClient.createSandbox` in `.opencode/plugin/tensorlake/core/client.ts`:
+The resource env vars (`TENSORLAKE_CPUS`, `TENSORLAKE_MEMORY_MB`, `TENSORLAKE_DISK_MB`, `TENSORLAKE_IMAGE`) are documented in the README. The code defaults live in `TensorlakeClient.getOrCreateSandbox` in `.opencode/plugin/tensorlake/core/client.ts`:
 
 ```typescript
 const cpus = parseFloat(process.env.TENSORLAKE_CPUS ?? '2')
 const memoryMb = parseInt(process.env.TENSORLAKE_MEMORY_MB ?? '4096', 10)
-const ephemeralDiskMb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
+const diskMb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
 ```
 
 To register a custom image:
@@ -244,4 +234,4 @@ tl sbx image create Dockerfile --registered-name my-custom-image
 1. Create a file in `.opencode/plugin/tensorlake/tools/` that follows the pattern of the existing tools.
 2. Import and register it in `.opencode/plugin/tensorlake/tools.ts`.
 
-Each tool factory receives `(sessionManager, projectId, worktree, pluginCtx)` and returns an object with `description`, `args` (a Zod schema map), and `execute(args, ctx)`.
+Each tool factory receives `(sessionManager, pluginCtx)` and returns an object with `description`, `args` (a Zod schema map), and `execute(args, ctx)`.

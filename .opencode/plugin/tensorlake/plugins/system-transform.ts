@@ -6,7 +6,7 @@ import type { TensorlakeSessionManager } from '../core/session-manager.js'
 
 export async function systemPromptTransform(_ctx: PluginInput, sessionManager: TensorlakeSessionManager) {
   return async (_input: ExperimentalChatSystemTransformInput, output: ExperimentalChatSystemTransformOutput) => {
-    const workDir = sessionManager.projectDir('')
+    const workDir = sessionManager.projectDir()
     const lines = [
       '## Tensorlake Sandbox Integration',
       'This session is running inside a Tensorlake sandbox.',

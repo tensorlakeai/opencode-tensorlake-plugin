@@ -6,8 +6,6 @@ import { shellQuote } from '../core/shell.js'
 
 export const writeTool = (
   sessionManager: TensorlakeSessionManager,
-  projectId: string,
-  worktree: string,
   pluginCtx: PluginInput,
 ) => ({
   description: 'Writes content to a file in the Tensorlake sandbox',
@@ -16,7 +14,7 @@ export const writeTool = (
     content: z.string(),
   },
   async execute(args: { filePath: string; content: string }, ctx: ToolContext) {
-    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, pluginCtx)
     const buf = Buffer.from(args.content)
     const dir = args.filePath.split('/').slice(0, -1).join('/')
     if (dir) {

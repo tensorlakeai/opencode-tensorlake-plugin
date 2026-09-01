@@ -8,8 +8,6 @@ const MAX_ENTRIES = 1000
 
 export const lsTool = (
   sessionManager: TensorlakeSessionManager,
-  projectId: string,
-  worktree: string,
   pluginCtx: PluginInput,
 ) => ({
   description: `Lists files in a directory in the Tensorlake sandbox, at most ${MAX_ENTRIES} entries. Directories end in "/".`,
@@ -17,8 +15,8 @@ export const lsTool = (
     dirPath: z.string().optional(),
   },
   async execute(args: { dirPath?: string }, ctx: ToolContext) {
-    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
-    const path = args.dirPath ?? sessionManager.projectDir(worktree)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, pluginCtx)
+    const path = args.dirPath ?? sessionManager.projectDir()
     // `ls -Ap` already marks directories with a trailing slash, and the cut
     // happens in the sandbox, so a directory with a million entries cannot
     // flood this process the way listDirectory would.

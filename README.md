@@ -7,7 +7,7 @@ An OpenCode plugin that runs all AI sessions inside isolated [Tensorlake](https:
 The plugin intercepts OpenCode's standard tools (`bash`, `read`, `write`, `edit`, `multiedit`, `apply_patch`, `ls`, `glob`, `grep`) and routes them to a Tensorlake sandbox at `/tmp/workspace`.
 
 - **Lazy creation** — no sandbox starts when you launch OpenCode. The sandbox is created on the model's first tool call in a session. To start one, ask the model to run a command.
-- **Lifecycle** — the sandbox is deleted when you delete the session. Sandbox state persists to disk, so sessions reconnect across OpenCode restarts. A suspended sandbox resumes automatically before use.
+- **Lifecycle** — each session's sandbox is named after the session (`opencode-<session id>`), and every tool call binds to it with `Sandbox.getOrCreate`. Nothing is stored locally: a session reconnects to its sandbox across OpenCode restarts, and from another machine. A suspended sandbox resumes automatically before use. The sandbox is deleted when you delete the session.
 - **Subagents share the sandbox** — a subagent (the `task` tool) runs in its own OpenCode session but uses the sandbox of the session that spawned it, so a task and the agent that spawned it see the same files. See [Subagents](#subagents).
 - **Persistent filesystem (optional)** — configure a Tensorlake filesystem and every sandbox mounts it at the working directory. Files there survive sandbox deletion. See [Persistent filesystem](#persistent-filesystem).
 - **Hosted git repository (optional)** — configure a Tensorlake-hosted git repository and every sandbox gets scoped git credentials for it, so the agent can clone, commit, and push to persist work. See [Hosted git repository](#hosted-git-repository).
@@ -74,7 +74,7 @@ Then name it in the plugin options or the environment:
 }
 ```
 
-Every sandbox now mounts that filesystem at the working directory (`/tmp/workspace`) — new sandboxes through `Sandbox.create`'s `fileSystems` option, reconnected ones through a live attach. Files the agent writes there persist in durable storage, survive sandbox deletion, and are shared with every other sandbox (or `tl fs mount` on your machine) that mounts the same filesystem. Set `filesystemPath` (or `TENSORLAKE_FILESYSTEM_PATH`) to mount it somewhere else.
+Every sandbox now mounts that filesystem at the working directory (`/tmp/workspace`) — new sandboxes through `Sandbox.getOrCreate`'s `fileSystems` option, reconnected ones through a live attach. Files the agent writes there persist in durable storage, survive sandbox deletion, and are shared with every other sandbox (or `tl fs mount` on your machine) that mounts the same filesystem. Set `filesystemPath` (or `TENSORLAKE_FILESYSTEM_PATH`) to mount it somewhere else.
 
 A misspelled filesystem name blocks tool calls with a clear error instead of running against ephemeral storage.
 

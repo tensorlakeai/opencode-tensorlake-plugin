@@ -11,11 +11,10 @@ import { eventHandlers } from './plugins/session-events.js'
 import { systemPromptTransform } from './plugins/system-transform.js'
 
 const LOG_FILE = join(xdgData ?? '/tmp', 'opencode', 'log', 'tensorlake.log')
-const STORAGE_DIR = join(xdgData ?? '/tmp', 'opencode', 'storage', 'tensorlake')
 const WORK_DIR = '/tmp/workspace'
 
 setLogFilePath(LOG_FILE)
-const sessionManager = new TensorlakeSessionManager(resolveApiKey, STORAGE_DIR, WORK_DIR)
+const sessionManager = new TensorlakeSessionManager(resolveApiKey, WORK_DIR)
 
 let exitRequested = false
 

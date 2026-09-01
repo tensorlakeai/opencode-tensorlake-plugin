@@ -216,8 +216,6 @@ export function applyHunks(content: string, hunks: Hunk[], path: string): string
 
 export const applyPatchTool = (
   sessionManager: TensorlakeSessionManager,
-  projectId: string,
-  worktree: string,
   pluginCtx: PluginInput,
 ) => ({
   description:
@@ -231,9 +229,9 @@ export const applyPatchTool = (
   },
   async execute(args: { patchText: string }, ctx: ToolContext) {
     const ops = parsePatch(args.patchText)
-    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, pluginCtx)
     const client = sessionManager.getClient()
-    const projectDir = sessionManager.projectDir(worktree)
+    const projectDir = sessionManager.projectDir()
     const resolve = (p: string) => (p.startsWith('/') ? posix.normalize(p) : posix.join(projectDir, p))
 
     // The patch is applied in three phases so it is all-or-nothing:
