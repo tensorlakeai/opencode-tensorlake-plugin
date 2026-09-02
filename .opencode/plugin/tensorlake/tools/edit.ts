@@ -55,8 +55,6 @@ export function applyEdit(content: string, edit: EditSpec, label: string): strin
 
 export const editTool = (
   sessionManager: TensorlakeSessionManager,
-  projectId: string,
-  worktree: string,
   pluginCtx: PluginInput,
 ) => ({
   description:
@@ -71,7 +69,7 @@ export const editTool = (
     args: { filePath: string; oldString: string; newString: string; replaceAll?: boolean },
     ctx: ToolContext,
   ) {
-    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, projectId, worktree, pluginCtx)
+    const { sandboxId } = await sessionManager.getSandbox(ctx.sessionID, pluginCtx)
     const client = sessionManager.getClient()
     const buffer = await client.readFileBounded(sandboxId, args.filePath, MAX_EDIT_BYTES)
     const content = new TextDecoder().decode(buffer)

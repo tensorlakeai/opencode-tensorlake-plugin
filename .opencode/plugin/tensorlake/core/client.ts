@@ -1,5 +1,5 @@
 import { RemoteAPIError, Sandbox, SandboxConnectionError, SandboxNotFoundError } from 'tensorlake'
-import type { FileSystemMount } from 'tensorlake'
+import type { FileSystemMount, GetOrCreateOutcome } from 'tensorlake'
 import { execFileSync } from 'child_process'
 import { logger } from './logger.js'
 import { shellQuote } from './shell.js'
@@ -10,14 +10,11 @@ const MANAGEMENT_API = process.env.TENSORLAKE_API_URL ?? 'https://api.tensorlake
  * tool call (e.g. deletion draining active leases) size themselves off this. */
 export const COMMAND_TIMEOUT_MS = 120_000
 
-export type SandboxInfo = {
-  sandbox_id: string
-  status: string
-}
-
-export type CreateSandboxResponse = {
-  sandbox_id: string
-  status: string
+/** What getOrCreateSandbox reports about the sandbox bound to a name. */
+export type BoundSandbox = {
+  sandboxId: string
+  /** What the bind did: created a sandbox, attached to a running one, or resumed a suspended one. */
+  outcome: GetOrCreateOutcome
 }
 
 export type ProcessResult = {
@@ -34,10 +31,23 @@ export type DirectoryEntry = {
 
 type HandleEntry = {
   apiKey: string
+  // Fingerprint of the proxy routing the handle was stored with (see
+  // routingFingerprint). A resume can move the sandbox to another host;
+  // getOrCreateSandbox compares this to decide whether a fresh handle must
+  // replace it. Unset for a handle from connectSandbox (routing unknown), so
+  // the next getOrCreateSandbox replaces that handle with one it can vouch for.
+  routing?: string
   promise: Promise<Sandbox>
   // Set once the connect resolves; lets dropHandle identity-check an eviction
   // without awaiting the promise.
   sandbox?: Sandbox
+}
+
+// Every field the SDK feeds into proxy selection (sandboxUrl, ingressEndpoint)
+// and request routing (routingHint). A change in any one of them means the
+// cached handle points at the wrong place, so none may mask another.
+function routingFingerprint(info: { sandboxUrl?: string; ingressEndpoint?: string; routingHint?: string }): string {
+  return JSON.stringify([info.sandboxUrl ?? null, info.ingressEndpoint ?? null, info.routingHint ?? null])
 }
 
 export class TensorlakeClient {
@@ -170,25 +180,52 @@ export class TensorlakeClient {
       })
   }
 
-  async createSandbox(opts: { image?: string; name?: string; timeoutSecs?: number; fileSystems?: FileSystemMount[] } = {}): Promise<CreateSandboxResponse> {
+  /**
+   * The one sandbox bound to `name`, running. Sandbox.getOrCreate does all
+   * the lifecycle work: it attaches to the sandbox holding the name, creates
+   * it when nothing does, waits for a sandbox another caller is still
+   * starting, and resumes a suspended one. The create options apply only
+   * when it creates.
+   *
+   * Handle caching: the new handle carries fresh proxy routing. It replaces
+   * the cached handle only when that routing changed or no handle is cached;
+   * otherwise it is closed and the cached handle stays, so tool calls already
+   * running on it are not cut off. The routing comes from `info()`, not from
+   * `bindOutcome`: a suspend and resume done outside this process moves the
+   * sandbox, yet this process then sees `attached`, not `resumed`.
+   */
+  async getOrCreateSandbox(
+    name: string,
+    opts: { image?: string; fileSystems?: FileSystemMount[] } = {},
+  ): Promise<BoundSandbox> {
     const cpus = parseFloat(process.env.TENSORLAKE_CPUS ?? '2')
     const memoryMb = parseInt(process.env.TENSORLAKE_MEMORY_MB ?? '4096', 10)
-    const ephemeralDiskMb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
-    logger.info(`Creating sandbox name=${opts.name ?? '(ephemeral)'} image=${opts.image ?? '(default)'} cpus=${cpus} memoryMb=${memoryMb} diskMb=${ephemeralDiskMb}`)
+    const diskMb = parseInt(process.env.TENSORLAKE_DISK_MB ?? '10240', 10)
     const proxyUrl = process.env.TENSORLAKE_SANDBOX_PROXY_URL
-    const sandbox = await Sandbox.create({
+    const apiKey = this.getApiKey()
+    const sandbox = await Sandbox.getOrCreate(name, {
       ...(proxyUrl ? { proxyUrl } : {}),
       ...(opts.image ? { image: opts.image } : {}),
       cpus,
       memoryMb,
-      diskMb: ephemeralDiskMb,
-      ...(opts.name ? { name: opts.name } : {}),
-      ...(opts.timeoutSecs ? { timeoutSecs: opts.timeoutSecs } : {}),
+      diskMb,
       ...(opts.fileSystems?.length ? { fileSystems: opts.fileSystems } : {}),
       ...this.clientOptions(),
     })
-    this.handles.set(sandbox.sandboxId, { apiKey: this.getApiKey(), promise: Promise.resolve(sandbox), sandbox })
-    return { sandbox_id: sandbox.sandboxId, status: 'running' }
+    const sandboxId = sandbox.sandboxId
+    const outcome = sandbox.bindOutcome ?? 'attached'
+    const info = await sandbox.info()
+    const routing = routingFingerprint(info)
+    const cached = this.handles.get(sandboxId)
+    if (cached && cached.apiKey === apiKey && cached.routing === routing) {
+      void Promise.resolve(sandbox.close()).catch(() => {
+        // closing the surplus handle is best-effort
+      })
+    } else {
+      this.dropHandle(sandboxId)
+      this.handles.set(sandboxId, { apiKey, routing, promise: Promise.resolve(sandbox), sandbox })
+    }
+    return { sandboxId, outcome }
   }
 
   async listSandboxFileSystems(sandboxId: string): Promise<FileSystemMount[]> {
@@ -207,35 +244,36 @@ export class TensorlakeClient {
     await this.withSandbox(sandboxId, (sandbox) => sandbox.detachFileSystem(mountPath), { retry: false })
   }
 
-  async getSandbox(sandboxId: string): Promise<SandboxInfo> {
-    const info = await this.withSandbox(sandboxId, (sandbox) => sandbox.info())
-    return { sandbox_id: info.sandboxId, status: info.status as unknown as string }
-  }
-
-  async deleteSandbox(sandboxId: string): Promise<void> {
+  /**
+   * Terminate a sandbox, by id or by name. Returns false when nothing held
+   * that identifier (already deleted), true when a sandbox was terminated.
+   */
+  async deleteSandbox(sandboxId: string): Promise<boolean> {
     try {
       // Route through withSandbox so a stale handle (revoked key, dead proxy
       // routing) is dropped and terminate() retried once on a fresh
       // connection. terminate() is safe to retry: a second attempt against an
       // already-terminated sandbox surfaces as not-found, handled below.
       await this.withSandbox(sandboxId, (sandbox) => sandbox.terminate())
+      return true
     } catch (err: unknown) {
       // Already deleted — treat as success.
-      if (err instanceof SandboxNotFoundError) return
-      if (err instanceof RemoteAPIError && err.statusCode === 404) return
+      if (err instanceof SandboxNotFoundError) return false
+      if (err instanceof RemoteAPIError && err.statusCode === 404) return false
       // The SDK passes the original untyped Error through when a native error
       // payload does not parse, so a not-found can also arrive as a plain
       // Error mentioning 404.
-      if (String((err as Error)?.message ?? err).includes('404')) return
+      if (String((err as Error)?.message ?? err).includes('404')) return false
       throw err
     } finally {
-      this.dropHandle(sandboxId)
-      this.activityAt.delete(sandboxId)
+      this.forgetSandbox(sandboxId)
     }
   }
 
-  async suspendSandbox(sandboxId: string): Promise<void> {
-    await this.withSandbox(sandboxId, (sandbox) => sandbox.suspend())
+  /** Drop the cached handle and activity record of a sandbox that is gone. */
+  forgetSandbox(sandboxId: string): void {
+    this.dropHandle(sandboxId)
+    this.activityAt.delete(sandboxId)
   }
 
   suspendSandboxSync(sandboxId: string): void {
@@ -260,34 +298,6 @@ export class TensorlakeClient {
       }
       execFileSync('sleep', ['0.5'])
     }
-  }
-
-  async resumeSandbox(sandboxId: string): Promise<void> {
-    // resume() waits for running and refreshes the handle's proxy routing.
-    await this.withSandbox(sandboxId, (sandbox) => sandbox.resume())
-  }
-
-  async waitForSuspended(sandboxId: string, timeoutMs = 30_000): Promise<void> {
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      const info = await this.getSandbox(sandboxId)
-      if (info.status === 'suspended' || info.status === 'terminated') return
-      await new Promise((r) => setTimeout(r, 500))
-    }
-  }
-
-  async waitForRunning(sandboxId: string, timeoutMs = 60_000): Promise<void> {
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      const info = await this.getSandbox(sandboxId)
-      if (info.status === 'running') return
-      // 'timeout' is terminal like 'terminated' — fail fast instead of polling to the deadline
-      if (info.status === 'terminated' || info.status === 'timeout') {
-        throw new Error(`Sandbox ${sandboxId} is ${info.status}`)
-      }
-      await new Promise((r) => setTimeout(r, 500))
-    }
-    throw new Error(`Sandbox ${sandboxId} did not become running within ${timeoutMs}ms`)
   }
 
   async executeCommand(

@@ -5,23 +5,35 @@ import { LOGIN_HINT, projectKeyWarning } from './credentials.js'
 import { logger } from './logger.js'
 import { toast } from './toast.js'
 import { SessionTree } from './session-tree.js'
-import { SessionStore } from './session-store.js'
 import { resolveFileSystemMount, ensureFileSystemMounted, assertFileSystemExists } from './filesystem.js'
 import { resolveGitRepo, bootstrapSandboxGit, GIT_CREDENTIAL_REFRESH_MS } from './git-bootstrap.js'
 import type { PluginInput } from '@opencode-ai/plugin'
 
 /**
  * What a delete request did. Only 'deleted' really tore a sandbox down — a
- * subagent session, or one whose sandbox another session still uses, is just
- * detached, and a session that never had a sandbox does nothing at all.
+ * subagent session is just detached, and a session that never had a sandbox
+ * does nothing at all.
  */
 export type DeleteOutcome = 'deleted' | 'detached' | 'none'
 
+/**
+ * The sandbox name for a session. This name is the whole session-to-sandbox
+ * binding: Sandbox.getOrCreate finds the sandbox by it from any process or
+ * machine, so nothing needs to be stored locally. Deterministic, so every
+ * call for one session lands on the same sandbox; a session id is globally
+ * unique, so no two sessions share a name.
+ */
+export function sandboxName(sessionId: string): string {
+  return `opencode-${sessionId}`.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 63)
+}
+
 export class TensorlakeSessionManager {
   private readonly client: TensorlakeClient
-  // In-memory cache: sessionId -> { sandboxId }
+  // Sandboxes bound in this process: sessionId -> sandboxId. Used to suspend
+  // them at exit and to skip the "sandbox ready" toast on later tool calls.
   private readonly cache = new Map<string, { sandboxId: string }>()
-  // In-flight getSandbox promises keyed by sessionId — prevents concurrent double-resume
+  // In-flight getSandbox promises keyed by sessionId — concurrent tool calls
+  // share one bind instead of each racing Sandbox.getOrCreate
   private readonly inflight = new Map<string, Promise<{ sandboxId: string }>>()
   // Sandboxes whose workspace preparation (workdir, filesystem, git) ran in this process
   private readonly prepared = new Set<string>()
@@ -29,12 +41,15 @@ export class TensorlakeSessionManager {
   private readonly prepareInflight = new Map<string, Promise<void>>()
   // Keys already checked for project scope — the warning fires once per key
   private readonly warnedKeys = new Set<string>()
+  // Filesystem names confirmed to exist, per API key — checked once per process
+  private readonly checkedFileSystems = new Set<string>()
   // Session -> the session that owns its sandbox. Subagent sessions share
   // their parent's sandbox instead of each getting their own workspace;
   // see SessionTree.
   private readonly sessions = new SessionTree()
   // Sessions whose sandbox was (or is being) deleted — a late tool call must
-  // fail instead of silently creating a fresh sandbox for a dead session
+  // fail instead of getOrCreate silently binding a fresh sandbox to a dead
+  // session
   private readonly deleting = new Set<string>()
   // In-flight deletion per session — a second session.deleted (or a manual
   // retry racing it) joins the first run instead of tearing down twice
@@ -73,15 +88,13 @@ export class TensorlakeSessionManager {
     return TensorlakeSessionManager.DRAIN_TIMEOUT_MS
   }
   public readonly workDir: string
-  private readonly store: SessionStore
   // Configured Tensorlake filesystem to attach to every sandbox (optional)
   private fsMount: FileSystemMount | undefined
   // Configured Tensorlake-hosted git repository to bootstrap (optional)
   private gitRepo: string | undefined
 
-  constructor(resolveKey: () => string | undefined, storageDir: string, workDir: string) {
+  constructor(resolveKey: () => string | undefined, workDir: string) {
     this.client = new TensorlakeClient(resolveKey)
-    this.store = new SessionStore(storageDir)
     this.workDir = workDir
   }
 
@@ -121,10 +134,9 @@ export class TensorlakeSessionManager {
 
   /**
    * Directory tools run in by default: the filesystem mount when one is
-   * configured, the plain workspace directory otherwise. The worktree
-   * parameter is kept for call-site compatibility with the tools.
+   * configured, the plain workspace directory otherwise.
    */
-  projectDir(_worktree: string): string {
+  projectDir(): string {
     return this.fsMount?.mountPath ?? this.workDir
   }
 
@@ -198,54 +210,27 @@ export class TensorlakeSessionManager {
       })
   }
 
-  private updateSession(projectId: string, worktree: string, sessionId: string, sandboxId: string): void {
-    this.store.update(projectId, worktree, (data) => {
-      data.sessions[sessionId] = {
-        sandboxId,
-        created: data.sessions[sessionId]?.created ?? Date.now(),
-        lastAccessed: Date.now(),
-      }
-    })
-  }
-
-  private removeSession(projectId: string, sessionId: string): void {
-    this.store.update(projectId, '', (data) => {
-      if (!(sessionId in data.sessions)) return false
-      delete data.sessions[sessionId]
-    })
-  }
-
   /**
    * The sandbox for a session. A subagent session is served the sandbox of the
    * session that spawned it, so the whole tree shares one workspace.
    */
-  async getSandbox(
-    sessionId: string,
-    projectId: string,
-    worktree: string,
-    pluginCtx?: PluginInput,
-  ): Promise<{ sandboxId: string }> {
+  async getSandbox(sessionId: string, pluginCtx?: PluginInput): Promise<{ sandboxId: string }> {
     const owner = await this.sessions.root(sessionId, pluginCtx)
     if (owner !== sessionId && !this.sharedLogged.has(sessionId)) {
       this.sharedLogged.add(sessionId)
       logger.info(`Session ${sessionId} is a subagent of ${owner}; routing its tool calls to the parent's sandbox`)
     }
-    return this.getOwnerSandbox(owner, projectId, worktree, pluginCtx)
+    return this.getOwnerSandbox(owner, pluginCtx)
   }
 
   /** getSandbox for a session id already resolved to its sandbox owner. */
-  private getOwnerSandbox(
-    sessionId: string,
-    projectId: string,
-    worktree: string,
-    pluginCtx?: PluginInput,
-  ): Promise<{ sandboxId: string }> {
+  private getOwnerSandbox(sessionId: string, pluginCtx?: PluginInput): Promise<{ sandboxId: string }> {
     if (this.deleting.has(sessionId)) {
       return Promise.reject(new Error(`Session ${sessionId} was deleted; its sandbox is gone and will not be recreated.`))
     }
     const existing = this.inflight.get(sessionId)
     if (existing) return existing
-    const promise = this._getSandbox(sessionId, projectId, worktree, pluginCtx)
+    const promise = this._getSandbox(sessionId, pluginCtx)
       .catch((err: unknown) => {
         throw this.asLoginError(err)
       })
@@ -266,12 +251,13 @@ export class TensorlakeSessionManager {
     return new Error(msg)
   }
 
-  private async _getSandbox(
-    sessionId: string,
-    projectId: string,
-    worktree: string,
-    pluginCtx?: PluginInput,
-  ): Promise<{ sandboxId: string }> {
+  /**
+   * Bind the session to its sandbox and make sure it is running. One call
+   * to Sandbox.getOrCreate covers every case the session can be in: no
+   * sandbox yet (create), a sandbox from an earlier process or machine
+   * (attach), a suspended one (resume), one still starting (wait).
+   */
+  private async _getSandbox(sessionId: string, pluginCtx?: PluginInput): Promise<{ sandboxId: string }> {
     if (pluginCtx?.client?.tui) toast.initialize(pluginCtx.client.tui)
 
     if (!this.client.hasApiKey()) {
@@ -293,115 +279,64 @@ export class TensorlakeSessionManager {
       }
     }
 
-    // Check in-memory cache
-    const cached = this.cache.get(sessionId)
-    if (cached) {
-      try {
-        const info = await this.client.getSandbox(cached.sandboxId)
-        // 'timeout' is terminal like 'terminated' — waiting on it never ends in 'running'
-        if (info.status === 'terminated' || info.status === 'timeout') {
-          logger.warn(`Sandbox ${cached.sandboxId} is ${info.status}, creating new one`)
-          this.cache.delete(sessionId)
-          this.removeSession(projectId, sessionId)
-          // Call _getSandbox directly: getSandbox would return the still-pending
-          // in-flight promise for this session, resolving the promise to itself.
-          return this._getSandbox(sessionId, projectId, worktree, pluginCtx)
-        }
-        if (info.status === 'suspended' || info.status === 'suspending') {
-          logger.info(`Resuming sandbox ${cached.sandboxId} (was ${info.status})`)
-          if (info.status === 'suspending') await this.client.waitForSuspended(cached.sandboxId)
-          // resumeSandbox blocks until the sandbox is running again
-          await this.client.resumeSandbox(cached.sandboxId)
-          toast.show({ title: 'Sandbox resumed', message: 'Sandbox resumed from suspension.', variant: 'info' })
-        } else if (info.status !== 'running') {
-          await this.client.waitForRunning(cached.sandboxId)
-        }
-        this.updateSession(projectId, worktree, sessionId, cached.sandboxId)
-        // No-op when already prepared; retries a previously failed preparation
-        await this.prepareSandbox(cached.sandboxId)
-        this.refreshGitCredentialIfStale(cached.sandboxId)
-        return cached
-      } catch (err) {
-        logger.warn(`Failed to check cached sandbox: ${err}`)
-        this.cache.delete(sessionId)
-      }
-    }
+    // The configured filesystem is attached at create time. Sandbox.create
+    // with an unknown filesystem fails with a bare FileSystemNotFound, so the
+    // name is confirmed first (once per process) to give the same clear error
+    // the attach path gives.
+    if (this.fsMount) await this.assertFileSystem(apiKey, this.fsMount.fileSystemId)
 
-    // Check persistent storage for this session only. Never adopt another
-    // session's sandbox: sessions must stay isolated, and deleting either
-    // session would tear down the shared sandbox.
-    const projectData = this.store.read(projectId)
-    const stored = projectData?.sessions[sessionId]
-
-    if (stored) {
-      logger.info(`Trying sandbox ${stored.sandboxId} from session ${sessionId}`)
-      let connected: { sandboxId: string } | undefined
-      try {
-        const info = await this.client.getSandbox(stored.sandboxId)
-        // 'timeout' is terminal like 'terminated' — waiting on it never ends in 'running'
-        if (info.status === 'terminated' || info.status === 'timeout') {
-          this.removeSession(projectId, sessionId)
-        } else {
-          if (info.status === 'suspended' || info.status === 'suspending') {
-            logger.info(`Resuming sandbox ${stored.sandboxId} (was ${info.status})`)
-            if (info.status === 'suspending') await this.client.waitForSuspended(stored.sandboxId)
-            // resumeSandbox blocks until the sandbox is running again
-            await this.client.resumeSandbox(stored.sandboxId)
-          } else if (info.status !== 'running') {
-            await this.client.waitForRunning(stored.sandboxId)
-          }
-          connected = { sandboxId: stored.sandboxId }
-          this.cache.set(sessionId, connected)
-          this.updateSession(projectId, worktree, sessionId, stored.sandboxId)
-          toast.show({ title: 'Sandbox connected', message: 'Connected to existing sandbox.', variant: 'info' })
-        }
-      } catch (err) {
-        logger.warn(`Failed to connect to sandbox ${stored.sandboxId}: ${err}`)
-        this.removeSession(projectId, sessionId)
-      }
-      // Outside the try: a preparation failure (transient mount or filesystem
-      // error) must not drop the mapping. The sandbox is healthy; the next
-      // call retries prepareSandbox against the same sandbox.
-      if (connected) {
-        await this.prepareSandbox(connected.sandboxId)
-        this.refreshGitCredentialIfStale(connected.sandboxId)
-        return connected
-      }
-    }
-
-    // Create new sandbox. The configured filesystem is attached at create
-    // time (Sandbox.create fileSystems); prepareSandbox below still waits for
-    // the guest to materialize the mount before the first tool runs in it.
-    logger.info(`Creating new sandbox for session ${sessionId}`)
-    if (this.fsMount) {
-      // Sandbox.create with an unknown filesystem fails with a bare
-      // FileSystemNotFound; check the name first so the user gets the same
-      // clear error the reconnect path gives.
-      try {
-        await assertFileSystemExists(this.client.getApiKey(), this.fsMount.fileSystemId)
-      } catch (err: any) {
-        logger.error(`Filesystem attach failed: ${err?.message ?? err}`)
-        toast.show({ title: 'Filesystem attach failed', message: `${err?.message ?? err}`, variant: 'error' })
-        throw err
-      }
-    }
-    const createStart = Date.now()
+    const name = sandboxName(sessionId)
     const image = process.env.TENSORLAKE_IMAGE
-    const sandboxName = `opencode-${sessionId}`.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 63)
-    const created = await this.client.createSandbox({
+    const start = Date.now()
+    const bound = await this.client.getOrCreateSandbox(name, {
       ...(image ? { image } : {}),
-      name: sandboxName,
       ...(this.fsMount ? { fileSystems: [this.fsMount] } : {}),
     })
-    logger.info(`Sandbox created ${created.sandbox_id} in ${Date.now() - createStart}ms`)
 
-    const entry = { sandboxId: created.sandbox_id }
-    this.cache.set(sessionId, entry)
-    this.updateSession(projectId, worktree, sessionId, created.sandbox_id)
+    const previous = this.cache.get(sessionId)?.sandboxId
+    if (previous !== bound.sandboxId) {
+      if (previous) {
+        // The sandbox this process knew is gone (idle timeout, deleted
+        // elsewhere) and the name now binds a new one; its per-sandbox state
+        // never comes back.
+        logger.warn(`Sandbox ${previous} for session ${sessionId} was replaced by ${bound.sandboxId}`)
+        this.client.forgetSandbox(previous)
+        this.prepared.delete(previous)
+        this.credRefreshedAt.delete(previous)
+      }
+      this.cache.set(sessionId, { sandboxId: bound.sandboxId })
+    }
+    if (previous !== bound.sandboxId || bound.outcome !== 'attached') {
+      logger.info(`Sandbox ${bound.sandboxId} (${name}) ${bound.outcome} for session ${sessionId} in ${Date.now() - start}ms`)
+    }
+    // A revisit of a running sandbox is only announced once per process. A
+    // create or resume is always announced: both mean the sandbox was not
+    // running a moment ago.
+    if (bound.outcome === 'created') {
+      toast.show({ title: 'Sandbox created', message: 'New sandbox is ready.', variant: 'success' })
+    } else if (bound.outcome === 'resumed') {
+      toast.show({ title: 'Sandbox resumed', message: 'Suspended sandbox is running again.', variant: 'info' })
+    } else if (previous !== bound.sandboxId) {
+      toast.show({ title: 'Sandbox connected', message: 'Connected to existing sandbox.', variant: 'info' })
+    }
 
-    toast.show({ title: 'Sandbox created', message: 'New sandbox is ready.', variant: 'success' })
-    await this.prepareSandbox(created.sandbox_id)
-    return entry
+    // No-op when already prepared; retries a previously failed preparation
+    await this.prepareSandbox(bound.sandboxId)
+    this.refreshGitCredentialIfStale(bound.sandboxId)
+    return { sandboxId: bound.sandboxId }
+  }
+
+  private async assertFileSystem(apiKey: string, fileSystemId: string): Promise<void> {
+    const key = `${apiKey}\0${fileSystemId}`
+    if (this.checkedFileSystems.has(key)) return
+    try {
+      await assertFileSystemExists(apiKey, fileSystemId)
+    } catch (err: any) {
+      logger.error(`Filesystem attach failed: ${err?.message ?? err}`)
+      toast.show({ title: 'Filesystem attach failed', message: `${err?.message ?? err}`, variant: 'error' })
+      throw err
+    }
+    this.checkedFileSystems.add(key)
   }
 
   /**
@@ -571,7 +506,7 @@ export class TensorlakeSessionManager {
    * Deleting a subagent session tears nothing down — the sandbox belongs to
    * the session that spawned it, which is very likely still using it.
    */
-  deleteSandbox(sessionId: string, projectId: string): Promise<DeleteOutcome> {
+  deleteSandbox(sessionId: string): Promise<DeleteOutcome> {
     // Cache-only: OpenCode has already dropped the session, so a lookup would
     // 404. The link was recorded when the session was created or deleted.
     const owner = this.sessions.rootCached(sessionId)
@@ -582,61 +517,46 @@ export class TensorlakeSessionManager {
     }
     const existing = this.deleteInflight.get(sessionId)
     if (existing) return existing
-    const run = this._deleteSandbox(sessionId, projectId).finally(() => this.deleteInflight.delete(sessionId))
+    const run = this._deleteSandbox(sessionId).finally(() => this.deleteInflight.delete(sessionId))
     this.deleteInflight.set(sessionId, run)
     return this.track(run)
   }
 
-  private async _deleteSandbox(sessionId: string, projectId: string): Promise<DeleteOutcome> {
+  private async _deleteSandbox(sessionId: string): Promise<DeleteOutcome> {
     // Block new tool calls from resurrecting the session first, then wait for
     // an in-flight getSandbox: a delete that raced sandbox creation would
-    // otherwise see no sandboxId, report success, and orphan the new sandbox.
+    // otherwise miss the new sandbox and orphan it.
     this.deleting.add(sessionId)
     const inflight = this.inflight.get(sessionId)
     if (inflight) await inflight.catch(() => undefined)
     // Tool calls that started before the tombstone are still writing inside
-    // the sandbox; let them finish so nothing is terminated mid-write. The
-    // sandbox id is resolved up front so the wait can watch its activity.
-    const knownSandboxId =
-      this.cache.get(sessionId)?.sandboxId ?? this.store.read(projectId)?.sessions[sessionId]?.sandboxId
+    // the sandbox; let them finish so nothing is terminated mid-write.
+    const knownSandboxId = this.cache.get(sessionId)?.sandboxId
     await this.waitForActiveTools(sessionId, knownSandboxId, TensorlakeSessionManager.DELETE_TOOL_IDLE_MS)
 
-    const cached = this.cache.get(sessionId)
-    const projectData = this.store.read(projectId)
-    const stored = projectData?.sessions[sessionId]
-    const sandboxId = cached?.sandboxId ?? stored?.sandboxId
-
-    if (!sandboxId) {
+    // Always delete by name. The name is the binding: it is what a tool
+    // call would attach to, from this process or any other. A cached id can
+    // be stale (its sandbox timed out and another process bound a new one to
+    // the name); deleting by that id would hit a dead sandbox, report
+    // nothing to delete, and orphan the live one.
+    const name = sandboxName(sessionId)
+    logger.info(`Deleting sandbox ${name} for session ${sessionId}`)
+    // Forget the session only after the sandbox is really gone. A throw here
+    // means the sandbox may still be running; keeping the cache entry lets
+    // shutdown still suspend it.
+    const existed = await this.client.deleteSandbox(name)
+    this.cache.delete(sessionId)
+    if (knownSandboxId) {
+      // Drop per-sandbox state — the id never comes back.
+      this.client.forgetSandbox(knownSandboxId)
+      this.prepared.delete(knownSandboxId)
+      this.credRefreshedAt.delete(knownSandboxId)
+    }
+    if (!existed) {
       logger.info(`No sandbox found for session ${sessionId}; nothing to delete`)
       return 'none'
     }
-
-    // Data persisted before sessions were isolated can alias one sandbox to
-    // several sessions. Only tear down the sandbox when no other session
-    // still references it; otherwise just detach this session.
-    const sharedWith = Object.entries(projectData?.sessions ?? {}).filter(
-      ([id, s]) => id !== sessionId && s.sandboxId === sandboxId,
-    )
-    if (sharedWith.length > 0) {
-      this.cache.delete(sessionId)
-      this.removeSession(projectId, sessionId)
-      logger.warn(`Sandbox ${sandboxId} is still used by ${sharedWith.length} other session(s); detached session ${sessionId} without deleting it`)
-      return 'detached'
-    }
-
-    logger.info(`Deleting sandbox ${sandboxId} for session ${sessionId}`)
-    // Forget the session only after the sandbox is really gone. deleteSandbox
-    // treats not-found as success, so a throw here means the sandbox may still
-    // be running — dropping the mapping would leave it orphaned and unfindable.
-    await this.client.deleteSandbox(sandboxId)
-    logger.info(`Sandbox ${sandboxId} deleted`)
-
-    this.cache.delete(sessionId)
-    this.removeSession(projectId, sessionId)
-
-    // Drop per-sandbox state — the id never comes back.
-    this.prepared.delete(sandboxId)
-    this.credRefreshedAt.delete(sandboxId)
+    logger.info(`Sandbox ${name} deleted`)
     return 'deleted'
   }
 }

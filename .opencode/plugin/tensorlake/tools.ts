@@ -39,21 +39,19 @@ function leased<T extends SandboxTool>(
 
 export function createTensorlakeTools(
   sessionManager: TensorlakeSessionManager,
-  projectId: string,
-  worktree: string,
   pluginCtx: PluginInput,
 ) {
   return {
-    bash: leased(sessionManager, pluginCtx, bashTool(sessionManager, projectId, worktree, pluginCtx)),
-    read: leased(sessionManager, pluginCtx, readTool(sessionManager, projectId, worktree, pluginCtx)),
-    write: leased(sessionManager, pluginCtx, writeTool(sessionManager, projectId, worktree, pluginCtx)),
-    edit: leased(sessionManager, pluginCtx, editTool(sessionManager, projectId, worktree, pluginCtx)),
-    multiedit: leased(sessionManager, pluginCtx, multiEditTool(sessionManager, projectId, worktree, pluginCtx)),
+    bash: leased(sessionManager, pluginCtx, bashTool(sessionManager, pluginCtx)),
+    read: leased(sessionManager, pluginCtx, readTool(sessionManager, pluginCtx)),
+    write: leased(sessionManager, pluginCtx, writeTool(sessionManager, pluginCtx)),
+    edit: leased(sessionManager, pluginCtx, editTool(sessionManager, pluginCtx)),
+    multiedit: leased(sessionManager, pluginCtx, multiEditTool(sessionManager, pluginCtx)),
     // Shadows OpenCode's built-in apply_patch, which writes to the LOCAL
     // filesystem and would otherwise bypass the sandbox entirely.
-    apply_patch: leased(sessionManager, pluginCtx, applyPatchTool(sessionManager, projectId, worktree, pluginCtx)),
-    ls: leased(sessionManager, pluginCtx, lsTool(sessionManager, projectId, worktree, pluginCtx)),
-    glob: leased(sessionManager, pluginCtx, globTool(sessionManager, projectId, worktree, pluginCtx)),
-    grep: leased(sessionManager, pluginCtx, grepTool(sessionManager, projectId, worktree, pluginCtx)),
+    apply_patch: leased(sessionManager, pluginCtx, applyPatchTool(sessionManager, pluginCtx)),
+    ls: leased(sessionManager, pluginCtx, lsTool(sessionManager, pluginCtx)),
+    glob: leased(sessionManager, pluginCtx, globTool(sessionManager, pluginCtx)),
+    grep: leased(sessionManager, pluginCtx, grepTool(sessionManager, pluginCtx)),
   }
 }
