@@ -300,6 +300,7 @@ export class TensorlakeSessionManager {
         // elsewhere) and the name now binds a new one; its per-sandbox state
         // never comes back.
         logger.warn(`Sandbox ${previous} for session ${sessionId} was replaced by ${bound.sandboxId}`)
+        this.client.forgetSandbox(previous)
         this.prepared.delete(previous)
         this.credRefreshedAt.delete(previous)
       }
