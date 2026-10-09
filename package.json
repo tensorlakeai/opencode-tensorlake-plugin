@@ -25,7 +25,7 @@
   ],
   "scripts": {
     "clean": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\"",
-    "build": "npm run clean && tsc -p tsconfig.lib.json",
+    "build": "pnpm run clean && tsc -p tsconfig.lib.json",
     "type-check": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test test/*.test.ts"
   },
@@ -39,5 +39,6 @@
     "@types/node": "^25.5.0",
     "tsx": "^4.23.12",
     "typescript": "^5.4.0"
-  }
+  },
+  "packageManager": "pnpm@11.28.5"
 }
